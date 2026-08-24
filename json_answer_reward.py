@@ -90,15 +90,16 @@ JSON RLVR Reward Function（分类奖励框架）
   R4（summary 一致性校验，Qwen3.5-0.8B 奖励模型）:
     使用 Qwen/Qwen3.5-0.8B（0.8B VLM）作为判官，运行在 CPU 上，
     校验模型输出的 summary 与 GT summary 是否语义一致。
-    模型加载和推理封装在同目录 reward_model.py 中，本文件只负责调用。
+    模型加载和推理封装在中央 reward_model_server.py 服务中，本文件通过
+    同目录 reward_model_client.py 发起单条 HTTP 请求，由服务动态攒批。
 
-    调用: reward_model.score_summary(pred_summary, gt_summary)
+    调用: reward_model_client.score_summary(pred_summary, gt_summary)
     返回: 1.0×P(A) + 0.5×P(B) + 0.0×P(C)，范围 [0, 1]
     性能: CPU bfloat16, 单样本 ~3s, batch 更快
 
     输入: pred summary（从模型输出 JSON 的 summary 键提取）
           gt summary（从 GT JSON 的 summary 键提取）
-    异常: reward_model 导入、模型加载或推理失败时直接抛出，中断训练；
+    异常: 客户端导入、HTTP 请求、模型加载或推理失败时直接抛出，中断训练；
           禁止静默去掉 R4 后继续训练。
 
     在第三/四类中的权重:
@@ -135,16 +136,16 @@ import threading
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-# R4 奖励模型 (Qwen3.5-0.8B, CPU) — 懒导入，首次需要 R4 时才加载模块。
+# R4 HTTP 客户端 — 懒导入，首次需要 R4 时才加载模块。
 # 用文件路径导入，避免 verl 从任意工作目录动态加载本文件时找不到同目录的
-# reward_model.py，也避免误导入环境中另一个同名模块。
+# reward_model_client.py，也避免误导入环境中另一个同名模块。
 _r4_score_summary_fn = None
 _r4_import_lock = threading.Lock()
-_R4_MODULE_NAME = "_spatialconsistency_r4_reward_model"
+_R4_MODULE_NAME = "_spatialconsistency_r4_reward_model_client"
 
 
 def _get_r4_score_summary():
-    """从同目录 reward_model.py 懒加载 score_summary。
+    """从同目录 reward_model_client.py 懒加载 score_summary。
 
     任何导入错误都会原样抛出。这里不返回降级 sentinel，防止训练在 R4
     实际失效后仍继续运行。
@@ -157,9 +158,9 @@ def _get_r4_score_summary():
         if _r4_score_summary_fn is not None:
             return _r4_score_summary_fn
 
-        module_path = Path(__file__).resolve().with_name("reward_model.py")
+        module_path = Path(__file__).resolve().with_name("reward_model_client.py")
         if not module_path.is_file():
-            raise FileNotFoundError(f"R4 reward model file not found: {module_path}")
+            raise FileNotFoundError(f"R4 reward client file not found: {module_path}")
 
         module = sys.modules.get(_R4_MODULE_NAME)
         if module is None:
@@ -167,7 +168,7 @@ def _get_r4_score_summary():
                 _R4_MODULE_NAME, module_path
             )
             if spec is None or spec.loader is None:
-                raise ImportError(f"Cannot load R4 reward model from {module_path}")
+                raise ImportError(f"Cannot load R4 reward client from {module_path}")
             module = importlib.util.module_from_spec(spec)
             sys.modules[_R4_MODULE_NAME] = module
             try:
@@ -706,7 +707,7 @@ def _score_r4(pred_obj, gt_obj):
     """R4: 用 Qwen3.5-0.8B 校验 pred summary 与 GT summary 是否语义一致。
 
     输入为调用方已经解析的 JSON 对象。预测 JSON/summary 无效属于普通坏
-    样本，R4 记 0；reward_model 的导入、加载和推理异常则直接向上抛出。
+    样本，R4 记 0；客户端、网络、模型加载和推理异常则直接向上抛出。
 
     Returns:
         float ∈ [0, 1]: 1.0×P(A) + 0.5×P(B) + 0.0×P(C)。

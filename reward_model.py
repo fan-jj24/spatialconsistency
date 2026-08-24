@@ -7,7 +7,7 @@ R4 奖励模型: Qwen3.5-0.8B summary 一致性校验。
 运行在 CPU 上（bfloat16）。
 
 设计:
-  - 模型单例: 全局只加载一次，进程内复用（verl reward worker 常驻）。
+  - 模型单例: 由 reward_model_server.py 常驻进程加载一份并复用。
   - 下载: ModelScope snapshot_download（sandbox 内 HF 不可达）。
   - CPU 推理: dtype=bfloat16, device_map="cpu"。
   - 批处理: 支持单条和批量调用，批量时统一 right-padding。
@@ -68,8 +68,9 @@ Prompt 设计:
             Answer:
 """
 
-import threading
 import logging
+import os
+import threading
 from typing import Optional, List, Tuple
 
 import torch
@@ -78,10 +79,12 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 
 # ── 模型配置 ──
-MODEL_NAME = "Qwen/Qwen3.5-0.8B"
+MODEL_NAME = os.environ.get("R4_MODEL_NAME", "Qwen/Qwen3.5-0.8B")
 # 本地模型路径: 设为 None 则从 ModelScope 自动下载到默认缓存目录；
 # 设为本地路径（如 "E:/models/Qwen3.5-0.8B"）则直接从本地加载，跳过下载。
-MODEL_LOCAL_PATH = "/home/deepspeed/model_output/Qwen3.5-0.8B"
+MODEL_LOCAL_PATH = os.environ.get(
+    "R4_MODEL_LOCAL_PATH", "/home/deepspeed/model_output/Qwen3.5-0.8B"
+) or None
 # CPU 推理: bfloat16（0.8B 模型 ~1.6GB）
 TORCH_DTYPE = "bfloat16"
 DEVICE = "cpu"
@@ -219,6 +222,10 @@ class RewardModel:
             except Exception as e:
                 logger.error("Failed to load reward model: %s", e)
                 raise
+
+    def load(self):
+        """显式加载模型，供常驻服务在接受打分请求前完成启动检查。"""
+        self._ensure_loaded()
 
     def _get_choice_token_ids(self) -> dict:
         """获取 A/B/C 各字母的 token id（严格验证）。

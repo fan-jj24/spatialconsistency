@@ -37,6 +37,16 @@ VERL_ROOT=${VERL_ROOT:-"/home/deepspeed/qwen/verl080"}
 DATA_ROOT=${DATA_ROOT:-"/home/deepspeed/model_output/RL1"}
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REWARD_FILE=${REWARD_FILE:-"${SCRIPT_DIR}/json_answer_reward.py"}
+R4_SERVER_FILE=${R4_SERVER_FILE:-"${SCRIPT_DIR}/reward_model_server.py"}
+R4_SERVER_PYTHON=${R4_SERVER_PYTHON:-python3}
+R4_SERVER_HOST=${R4_SERVER_HOST:-127.0.0.1}
+R4_SERVER_PORT=${R4_SERVER_PORT:-8765}
+R4_SERVER_MAX_BATCH_SIZE=${R4_SERVER_MAX_BATCH_SIZE:-32}
+R4_SERVER_MAX_WAIT_MS=${R4_SERVER_MAX_WAIT_MS:-20}
+R4_SERVER_STARTUP_TIMEOUT=${R4_SERVER_STARTUP_TIMEOUT:-600}
+R4_SERVER_LOG=${R4_SERVER_LOG:-"/tmp/spatialconsistency_r4_reward_server.log"}
+export R4_REWARD_URL=${R4_REWARD_URL:-"http://${R4_SERVER_HOST}:${R4_SERVER_PORT}"}
+export R4_REWARD_TIMEOUT_SECONDS=${R4_REWARD_TIMEOUT_SECONDS:-300}
 
 # 11 个数据集目录
 DATASET_NAMES=(
@@ -173,6 +183,7 @@ echo "============================================================"
 echo "  模型:           ${MODEL_PATH}"
 echo "  数据根目录:     ${DATA_ROOT}"
 echo "  Reward:         ${REWARD_FILE}"
+echo "  R4 service:     ${R4_REWARD_URL} (batch=${R4_SERVER_MAX_BATCH_SIZE}, wait=${R4_SERVER_MAX_WAIT_MS}ms)"
 echo "  Epochs:         ${TOTAL_EPOCHS} (ppo_epochs=1, 样本不重复迭代)"
 echo "  LR:             ${ACTOR_LR} (warmup steps=${ACTOR_LR_WARMUP_STEPS})"
 echo "  Batch:          train=${TRAIN_BATCH_SIZE}, mini=${PPO_MINI_BATCH_SIZE}, rollout_n=${ROLLOUT_N}"
@@ -186,6 +197,11 @@ echo "============================================================"
 # 校验文件
 if [ ! -f "${REWARD_FILE}" ]; then
     echo "ERROR: Reward function 不存在: ${REWARD_FILE}"
+    exit 1
+fi
+
+if [ ! -f "${R4_SERVER_FILE}" ]; then
+    echo "ERROR: R4 reward service 不存在: ${R4_SERVER_FILE}"
     exit 1
 fi
 
@@ -359,6 +375,54 @@ TRAINER=(
     trainer.validation_data_dir="${CKPT_DIR}/val_generations"
     trainer.log_val_generations=10
 )
+
+# ------------------------------------------------------------
+# 启动中央 R4 动态批处理服务
+# ------------------------------------------------------------
+echo "启动 R4 reward service，日志: ${R4_SERVER_LOG}"
+"${R4_SERVER_PYTHON}" "${R4_SERVER_FILE}" \
+    --host "${R4_SERVER_HOST}" \
+    --port "${R4_SERVER_PORT}" \
+    --max-batch-size "${R4_SERVER_MAX_BATCH_SIZE}" \
+    --max-wait-ms "${R4_SERVER_MAX_WAIT_MS}" \
+    >"${R4_SERVER_LOG}" 2>&1 &
+R4_SERVER_PID=$!
+
+cleanup_r4_server() {
+    if kill -0 "${R4_SERVER_PID}" 2>/dev/null; then
+        kill "${R4_SERVER_PID}" 2>/dev/null || true
+        wait "${R4_SERVER_PID}" 2>/dev/null || true
+    fi
+}
+trap cleanup_r4_server EXIT INT TERM
+
+R4_START_DEADLINE=$((SECONDS + R4_SERVER_STARTUP_TIMEOUT))
+while true; do
+    if ! kill -0 "${R4_SERVER_PID}" 2>/dev/null; then
+        wait "${R4_SERVER_PID}" || R4_EXIT_CODE=$?
+        echo "ERROR: R4 reward service 启动失败，exit=${R4_EXIT_CODE:-0}"
+        tail -n 100 "${R4_SERVER_LOG}" || true
+        exit 1
+    fi
+    if "${R4_SERVER_PYTHON}" - "${R4_REWARD_URL}/health" <<'PY' >/dev/null 2>&1
+import sys
+from urllib.request import urlopen
+
+with urlopen(sys.argv[1], timeout=2) as response:
+    if response.status != 200:
+        raise RuntimeError(f"health check returned HTTP {response.status}")
+PY
+    then
+        break
+    fi
+    if [ "${SECONDS}" -ge "${R4_START_DEADLINE}" ]; then
+        echo "ERROR: R4 reward service 在 ${R4_SERVER_STARTUP_TIMEOUT}s 内未就绪"
+        tail -n 100 "${R4_SERVER_LOG}" || true
+        exit 1
+    fi
+    sleep 1
+done
+echo "R4 reward service 已就绪 (pid=${R4_SERVER_PID})"
 
 # ------------------------------------------------------------
 # 启动训练
