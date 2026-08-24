@@ -342,13 +342,21 @@ class RewardModel:
 
         Returns:
             float ∈ [0, 1]: 加权分数 = 1.0×P(A) + 0.5×P(B) + 0.0×P(C)。
+
+        Raises:
+            Exception: 模型加载或推理失败时原样抛出，由调用方中断训练。
         """
         if not pred_summary or not gt_summary:
             return 0.0
         self._ensure_loaded()
 
         prompt = self._build_prompt(pred_summary, gt_summary)
-        inputs = self._tokenizer(prompt, return_tensors="pt")
+        inputs = self._tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=2048,
+        )
 
         with self._infer_lock:
             with torch.no_grad():
@@ -377,13 +385,28 @@ class RewardModel:
             pairs: [(pred_summary, gt_summary), ...]
         Returns:
             [float, ...]: 每对的加权分数。
+
+        Raises:
+            Exception: 模型加载或推理失败时原样抛出，由调用方中断训练。
         """
         if not pairs:
             return []
+
+        # 与单条接口保持一致：缺少任一 summary 的样本记 0，
+        # 不为它们构建 prompt 或执行模型推理。
+        scores = [0.0] * len(pairs)
+        valid_indices = [
+            index
+            for index, (pred_summary, gt_summary) in enumerate(pairs)
+            if pred_summary and gt_summary
+        ]
+        if not valid_indices:
+            return scores
+
         self._ensure_loaded()
 
-        # 构建所有 prompt
-        prompts = [self._build_prompt(p, g) for p, g in pairs]
+        # 只为 summary 完整的样本构建 prompt。
+        prompts = [self._build_prompt(*pairs[index]) for index in valid_indices]
         # right-padding（padding 在末尾）
         encoded = self._tokenizer(
             prompts,
@@ -410,8 +433,10 @@ class RewardModel:
                 )
                 last_hidden = hidden_states[batch_indices, seq_lengths, :]
                 choice_logits = self._hidden_to_choice_logits(last_hidden)
-                scores = self._choice_logits_to_scores(choice_logits)
+                valid_scores = self._choice_logits_to_scores(choice_logits)
 
+        for index, score in zip(valid_indices, valid_scores):
+            scores[index] = score
         return scores
 
 

@@ -90,22 +90,20 @@ JSON RLVR Reward Function（分类奖励框架）
   R4（summary 一致性校验，Qwen3.5-0.8B 奖励模型）:
     使用 Qwen/Qwen3.5-0.8B（0.8B VLM）作为判官，运行在 CPU 上，
     校验模型输出的 summary 与 GT summary 是否语义一致。
-    模型加载和推理封装在 r4_summary_judge.py 中，本文件只负责调用。
+    模型加载和推理封装在同目录 reward_model.py 中，本文件只负责调用。
 
-    调用: r4_summary_judge.judge_summary_consistency(pred_summary, gt_summary)
-    返回: 1.0 (一致), 0.0 (不一致), 0.5 (无法判断)
+    调用: reward_model.score_summary(pred_summary, gt_summary)
+    返回: 1.0×P(A) + 0.5×P(B) + 0.0×P(C)，范围 [0, 1]
     性能: CPU bfloat16, 单样本 ~3s, batch 更快
 
     输入: pred summary（从模型输出 JSON 的 summary 键提取）
           gt summary（从 GT JSON 的 summary 键提取）
-    降级: 模型不可用时返回 -1.0，reward function 将 R4 权重项置 0
-          （不影响其他子项）。
+    异常: reward_model 导入、模型加载或推理失败时直接抛出，中断训练；
+          禁止静默去掉 R4 后继续训练。
 
     在第三/四类中的权重:
       第三类: R = C × (0.15 + 0.65×R2 + 0.1×R3 + 0.1×R4)
       第四类: R = 0.75×R2 + 0.15×R3 + 0.1×R4
-    R4 = -1（模型不可用）时，对应权重项置 0，其余子项权重不变。
-
 ━━━ 设计约束 ━━━
   - 第一类保持严格 0/1 二值: DAPO 的 filter_groups.metric=acc 依赖
     组内二值对错来过滤全对/全错 group。
@@ -127,32 +125,65 @@ verl 调用签名:
     custom_reward_function.name = compute_score
 """
 
+import importlib.util
 import json
-import logging
+from pathlib import Path
 import re
+import sys
+import threading
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-logger = logging.getLogger(__name__)
+# R4 奖励模型 (Qwen3.5-0.8B, CPU) — 懒导入，首次需要 R4 时才加载模块。
+# 用文件路径导入，避免 verl 从任意工作目录动态加载本文件时找不到同目录的
+# reward_model.py，也避免误导入环境中另一个同名模块。
+_r4_score_summary_fn = None
+_r4_import_lock = threading.Lock()
+_R4_MODULE_NAME = "_spatialconsistency_r4_reward_model"
 
-# R4 奖励模型 (Qwen3.5-0.8B, CPU) — 懒加载, 首次调用时才 import
-_r4_judge = None
 
+def _get_r4_score_summary():
+    """从同目录 reward_model.py 懒加载 score_summary。
 
-def _get_r4_judge():
-    """懒加载 R4 summary 判官。首次调用时 import, 失败返回 None。"""
-    global _r4_judge
-    if _r4_judge is not None:
-        return _r4_judge
-    try:
-        from r4_summary_judge import judge_summary_consistency
-        _r4_judge = judge_summary_consistency
-        logger.info("[R4] r4_summary_judge loaded successfully.")
-    except Exception as e:
-        logger.warning(f"[R4] Failed to load r4_summary_judge: {e}")
-        _r4_judge = None
-    return _r4_judge
+    任何导入错误都会原样抛出。这里不返回降级 sentinel，防止训练在 R4
+    实际失效后仍继续运行。
+    """
+    global _r4_score_summary_fn
+    if _r4_score_summary_fn is not None:
+        return _r4_score_summary_fn
+
+    with _r4_import_lock:
+        if _r4_score_summary_fn is not None:
+            return _r4_score_summary_fn
+
+        module_path = Path(__file__).resolve().with_name("reward_model.py")
+        if not module_path.is_file():
+            raise FileNotFoundError(f"R4 reward model file not found: {module_path}")
+
+        module = sys.modules.get(_R4_MODULE_NAME)
+        if module is None:
+            spec = importlib.util.spec_from_file_location(
+                _R4_MODULE_NAME, module_path
+            )
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Cannot load R4 reward model from {module_path}")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[_R4_MODULE_NAME] = module
+            try:
+                spec.loader.exec_module(module)
+            except Exception:
+                if sys.modules.get(_R4_MODULE_NAME) is module:
+                    del sys.modules[_R4_MODULE_NAME]
+                raise
+
+        score_fn = getattr(module, "score_summary", None)
+        if not callable(score_fn):
+            raise AttributeError(
+                f"score_summary is missing or not callable in {module_path}"
+            )
+        _r4_score_summary_fn = score_fn
+        return _r4_score_summary_fn
 
 
 # ============================================================
@@ -671,37 +702,29 @@ def _extract_direction_vec(label, bbox):
 # R4: summary 一致性校验 (Qwen3.5-0.8B 奖励模型)
 # ============================================================
 
-def _score_r4(solution_str, ground_truth):
+def _score_r4(pred_obj, gt_obj):
     """R4: 用 Qwen3.5-0.8B 校验 pred summary 与 GT summary 是否语义一致。
 
-    从 GT 和模型输出的 JSON 中提取 summary 文本，调用 r4_summary_judge
-    做二选一 (yes/no) 判断。
+    输入为调用方已经解析的 JSON 对象。预测 JSON/summary 无效属于普通坏
+    样本，R4 记 0；reward_model 的导入、加载和推理异常则直接向上抛出。
 
     Returns:
-        float: 1.0 (一致), 0.0 (不一致), 0.5 (无法判断)
-        -1.0: 模型不可用或 JSON 解析失败 (调用方应将权重置 0)
+        float ∈ [0, 1]: 1.0×P(A) + 0.5×P(B) + 0.0×P(C)。
     """
-    judge = _get_r4_judge()
-    if judge is None:
-        return -1.0
-
-    gt_obj = _parse_json_obj(ground_truth)
-    pred_obj = _parse_json_obj(solution_str)
-    if gt_obj is None or pred_obj is None:
-        return -1.0
+    if not isinstance(pred_obj, dict) or not isinstance(gt_obj, dict):
+        return 0.0
 
     gt_summary = gt_obj.get("summary", "")
     pred_summary = pred_obj.get("summary", "")
-    if not isinstance(gt_summary, str):
-        gt_summary = str(gt_summary) if gt_summary else ""
-    if not isinstance(pred_summary, str):
-        pred_summary = str(pred_summary) if pred_summary else ""
+    if not isinstance(gt_summary, str) or not isinstance(pred_summary, str):
+        return 0.0
+    if not gt_summary.strip() or not pred_summary.strip():
+        return 0.0
 
-    try:
-        return float(judge(pred_summary, gt_summary))
-    except Exception as e:
-        logger.warning(f"[R4] judge call failed: {e}")
-        return -1.0
+    score = float(_get_r4_score_summary()(pred_summary, gt_summary))
+    if not np.isfinite(score) or not 0.0 <= score <= 1.0:
+        raise ValueError(f"R4 returned an invalid score: {score!r}")
+    return score
 
 
 def _hungarian_match(gt_entries, pred_entries):
@@ -723,33 +746,6 @@ def _hungarian_match(gt_entries, pred_entries):
 
 
 # ============================================================
-# R4: summary 一致性校验（Qwen3.5-0.8B 奖励模型）
-# ============================================================
-
-def _score_r4_summary(pred_obj, gt_obj):
-    """R4: 使用 Qwen3.5-0.8B 校验 pred summary 与 GT summary 是否语义一致。
-
-    Args:
-        pred_obj: 模型输出的 JSON dict（已解析）
-        gt_obj: GT 的 JSON dict（已解析）
-    Returns:
-        float ∈ [0, 1]: P(yes)，越高越一致。
-        -1.0: 模型不可用或 summary 缺失（调用方应将 R4 项置 0）。
-    """
-    if not pred_obj or not gt_obj:
-        return -1.0
-    pred_summary = pred_obj.get("summary", "")
-    gt_summary = gt_obj.get("summary", "")
-    if not pred_summary or not gt_summary:
-        return -1.0
-    try:
-        from reward_model import score_summary
-        return score_summary(str(pred_summary), str(gt_summary))
-    except Exception:
-        return -1.0
-
-
-# ============================================================
 # 第三类: spatial_consistency_bbox 组合奖励
 # ============================================================
 
@@ -760,8 +756,6 @@ def score_spatial_consistency_bbox(solution_str, ground_truth):
       C=0 → R=0;  C=1 且预测空 → 1.0;  C=1 且预测非空 → 0.2
     GT boxes 非空（负例）:
       R = C × (0.15 + 0.65×R2 + 0.1×R3 + 0.1×R4)
-      R4 = -1（模型不可用）时，R4 项置 0:
-      R = C × (0.15 + 0.65×R2 + 0.1×R3)
 
     R3 已融入 IoU 缩放和方向系数（原方向 R4）。
     R4 为 summary 一致性校验（Qwen3.5-0.8B 奖励模型）。
@@ -788,10 +782,7 @@ def score_spatial_consistency_bbox(solution_str, ground_truth):
     r2 = _score_r2(gt_entries, pred_entries)
     matches = _hungarian_match(gt_entries, pred_entries)
     r3 = _score_r3(gt_entries, pred_entries, matches)
-    r4 = _score_r4(solution_str, ground_truth)
-    if r4 < 0:
-        # 模型不可用，R4 项置 0
-        return c * (0.15 + 0.65 * r2 + 0.1 * r3)
+    r4 = _score_r4(pred_obj, gt_obj)
     return c * (0.15 + 0.65 * r2 + 0.1 * r3 + 0.1 * r4)
 
 
@@ -803,8 +794,6 @@ def score_spatial_detection(solution_str, ground_truth):
     """第四类奖励: spatial_detection 组合奖励（全负例，无门控）。
 
     R = 0.75×R2 + 0.15×R3 + 0.1×R4
-    R4 = -1（模型不可用）时，R4 项置 0:
-    R = 0.75×R2 + 0.15×R3
     GT 结构同第三类，但无 C 门控、无正例空框分支。
 
     R3 已融入 IoU 缩放和方向系数（原方向 R4）。
@@ -817,9 +806,7 @@ def score_spatial_detection(solution_str, ground_truth):
     r2 = _score_r2(gt_entries, pred_entries)
     matches = _hungarian_match(gt_entries, pred_entries)
     r3 = _score_r3(gt_entries, pred_entries, matches)
-    r4 = _score_r4(solution_str, ground_truth)
-    if r4 < 0:
-        return 0.75 * r2 + 0.15 * r3
+    r4 = _score_r4(pred_obj, gt_obj)
     return 0.75 * r2 + 0.15 * r3 + 0.1 * r4
 
 
@@ -960,9 +947,10 @@ if __name__ == "__main__":
         else:
             print(f"  [INFO] {i+1:2d}. {desc}: reward={score:.4f}")
 
-    # --- 第三类测试 (R4可用时: R = C×(0.15+0.65×R2+0.1×R3+0.1×R4)) ---
-    # 注: R4 调用 Qwen3.5-0.8B, 测试中 pred/GT summary 均为 "inconsistent",
-    #     模型判一致 → R4=1.0。若模型不可用, R4=-1 → 权重项置 0。
+    # --- 第三类测试 (R = C×(0.15+0.65×R2+0.1×R3+0.1×R4)) ---
+    # 这里只回归组合公式，固定 R4=1.0，避免把模型概率波动写成精确断言。
+    # reward_model.py 的 __main__ 单独负责真实模型的单条/批量推理测试。
+    _r4_score_summary_fn = lambda pred, gt: 1.0
     print("\n=== 第三类: spatial_consistency_bbox 组合奖励 ===\n")
     scb_think = "\n"
     gt_pos = '{"answer": "A", "summary": "consistent", "boxes": []}'
@@ -1038,7 +1026,7 @@ if __name__ == "__main__":
     # --- 路由测试 ---
     print("\n=== data_source 路由测试 ===\n")
     sd_gt_route = ('{"answer": "B", "summary": "inconsistent", '
-                   '"boxes": [{"bbox": [0,0,100,100], "label": "move (50, 50)"}]}')
+                   '"boxes": [{"bbox": [0,0,100,100], "label": "move (100, 50)"}]}')
     route_cases = [
         ("spatialscore", think + good_json, '{"answer": "B"}', 1.0),
         ("spatial_consistency_pos", think + good_json, '{"answer": "B"}', 1.0),
@@ -1055,7 +1043,7 @@ if __name__ == "__main__":
          gt_pos, 1.0),
         # R2=1, R3=1, R4=1 → R = 0.75+0.15+0.1 = 1.0
         ("spatial_detection",
-         '{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move (50, 50)"}]}',
+         '{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move (100, 50)"}]}',
          sd_gt_route, 1.0),
     ]
     for ds, sol, gt, exp in route_cases:
@@ -1068,9 +1056,7 @@ if __name__ == "__main__":
         else:
             print(f"  [INFO] {ds}: reward={score:.4f}")
 
-    # --- 第四类测试 (R4可用时: R = 0.75×R2 + 0.15×R3 + 0.1×R4) ---
-    # 注: R4 调用 Qwen3.5-0.8B, 测试中 pred/GT summary 均为 "inconsistent",
-    #     模型判一致 → R4=1.0。若模型不可用, R4=-1 → 权重项置 0。
+    # --- 第四类测试 (R = 0.75×R2 + 0.15×R3 + 0.1×R4) ---
     print("\n=== 第四类: spatial_detection 组合奖励 ===\n")
     sd_gt = ('{"answer": "B", "summary": "inconsistent", '
              '"boxes": [{"bbox": [0,0,100,100], "label": "move (100, 50)"}]}')
