@@ -1,0 +1,10 @@
+./wandb
+./outputs
+./verl.egg-info
+./.vscode
+./.codex
+./.claude
+./.agent
+./tar_log.txt
+*/.git
+*/.git/*

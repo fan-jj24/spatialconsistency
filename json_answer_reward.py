@@ -1,0 +1,923 @@
+#!/usr/bin/env python3
+"""
+JSON RLVR Reward Function（分类奖励框架）
+适用于 verl 框架的 custom_reward_function。
+
+按 data_source 路由到四类奖励:
+
+━━━ 第一类: JSON answer 二值奖励 ━━━
+  data_source: spatial_consistency_pos / spatial_consistency_neg /
+               vst_caption / spatialscore / spatialcorpus_vi /
+               viewspatial / vst_oor
+  GT:          {"answer": "B"}
+  模型输出:    <think>...</think> + {"answer": "B", "summary": "..."}
+  逻辑:        解析模型 JSON 的 answer 键，与 GT 的 answer 做 exact match
+  值域:        答对=1.0，答错/JSON缺失/无法解析=0.0
+
+━━━ 第二类: bbox 匈牙利匹配 IoU 奖励 ━━━
+  data_source: humanref_cot
+  GT:          {"boxes": [[x1,y1,x2,y2], ...]}  (纯坐标数组)
+  模型输出:    同上
+  逻辑:        1) 每个框 clamp 到 [0,1000]
+              2) 构造 n×m IoU 矩阵，匈牙利算法求总 IoU 最大的一对一匹配 M*
+              3) reward = Σ IoU(M*) / max(n, m)
+  值域:        [0, 1] 连续值
+  设计:        分母取 max(n,m): 漏检(n大)和多报(m大)都被惩罚，
+              模型无法靠多输出框刷分。无匹配阈值。
+
+━━━ 第三类: spatial_consistency_bbox 组合奖励 ━━━
+  data_source: spatial_consistency_bbox_pos / spatial_consistency_bbox_neg
+  GT:          {"answer": "B", "summary": "...",
+               "boxes": [{"bbox": [x1,y1,x2,y2], "label": "..."}, ...]}
+               正例时 boxes 为空 []
+  逻辑:
+    GT boxes 为空（正例）:
+      C=0 → R=0
+      C=1 且预测 boxes 也为空 → R=1.0
+      C=1 且预测 boxes 非空   → R=0.2
+    GT boxes 非空（负例）:
+      R = C × (0.2 + 0.7×R2 + 0.1×R3)
+      C  = answer 门控（0/1）
+      R2 = GT 所有框并集 vs 预测所有框并集 的 IoU（栅格化）
+      R3 = 匈牙利匹配后，逐框对 label 关键词子集召回匹配，取平均
+           （罚多报: pred 含 GT 没有的关键词 → 该对记 0）
+      R4 = 方向夹角项，当前停用（疑似 hacking；代码保留，见函数内注释）
+  值域:        [0, 1] 连续值
+
+━━━ 第四类: spatial_detection 组合奖励 ━━━
+  data_source: spatial_detection
+  GT:          同第三类结构（全负例，无正例空框分支）
+  逻辑:        R = 0.8×R2 + 0.15×R3 + 0.05×R4
+              无 C 门控，无正例分支
+  值域:        [0, 1] 连续值
+
+━━━ R2/R3/R4 子项详解（第三、四类共用）━━━
+  R2（并集 IoU）:
+    将 GT 所有非空框的并集区域、预测所有非空框的并集区域，
+    分别栅格化到 1000×1000 布尔掩码，做像素级 IoU。
+    天然处理缺口、分离框、重叠框。空集vs空集=1.0，任一为空=0.0。
+
+  R3（label 关键词子集召回匹配）:
+    先对 GT 和预测的框做匈牙利匹配（按 IoU 最大化），
+    然后对每个匹配上的框对，从各自 label 文本中提取关键词集合
+    (add / delete / rotate / replace / move，词边界匹配)，
+    按【子集召回】规则计分——罚多报、不罚少报:
+      pred 集合 ⊆ GT 集合 → 得分 = |pred ∩ GT| / |GT|
+        （说少了按召回给部分分，保留梯度信号）
+      pred 集合含任何 GT 没有的关键词（说多了）→ 记 0
+        （多报是 reward hacking 方向: 无脑输出全部关键词
+         若只略微扣分，反而成为稳赚策略，故直接归零）
+    GT 关键词集为空 → 该对无法评估，记 0。
+    最终取所有匹配对的平均。无匹配 → 0.0。
+
+  R4（方向夹角映射）:
+    格式硬门控（前置）: 任一匹配对的预测 label 出现超过一组
+    括号数值向量 → R4 = -1（防止模型输出多个括号向量刷分）。
+    在匈牙利匹配的每个框对上，从各自 label 文本中提取
+    括号内的数值向量，归一化成 2D 方向后算夹角:
+      二值 (x,y): 位置 → 方向 = (x-cx, cy-y)
+                  cx,cy = 该框各自中心; 第一维正=右, 第二维正=上
+      三值 (x,y,z): 方向本身 → 取前两维 (x,y)
+    夹角映射直接用 cosθ ∈ [-1, 1] (同向=1, 垂直=0, 反向=-1)。
+    维度不一致处理:
+      GT 二值 + 预测三值 → 不罚（砍第三维算夹角）
+      GT 三值 + 预测二值 → 扣 0.2（丢失 GT 已有的深度），不 clamp 下限
+    任一 label 无括号数值 → 该对记 0。最终取所有匹配对的平均。
+
+━━━ 设计约束 ━━━
+  - 第一类保持严格 0/1 二值: DAPO 的 filter_groups.metric=acc 依赖
+    组内二值对错来过滤全对/全错 group。
+  - 第二/三/四类为连续值: 组内几乎必然存在方差，filter_groups 的
+    过滤基本不再触发——这是预期行为，连续奖励任务不依赖该机制。
+  - 长度惩罚不在本函数内: 由 DAPO reward manager 的
+    Overlong Buffer 单独控制。
+  - 路由无兜底: 未知 data_source 直接 raise ValueError。
+    历史上静默兜底到第一类曾导致 bbox 任务被悄悄降级为纯 answer
+    匹配（reward 退化为 C）而无人察觉，故改为显式报错。
+
+verl 调用签名:
+    def compute_score(data_source, solution_str, ground_truth, extra_info=None):
+        ...
+        return float  # 标量 reward
+
+在 verl 配置中注册:
+    custom_reward_function.path = /path/to/json_answer_reward.py
+    custom_reward_function.name = compute_score
+"""
+
+import json
+import re
+
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+
+
+# ============================================================
+# 共享工具函数
+# ============================================================
+
+def _clamp_box(box, lo=0, hi=1000):
+    """将 bbox 的 4 个值 clamp 到 [lo, hi]。"""
+    return [max(lo, min(hi, v)) for v in box]
+
+
+def _iou(box_a, box_b):
+    """计算两个 [x1,y1,x2,y2] 框的 IoU。坐标已 clamp 到 [0,1000]。"""
+    x1 = max(box_a[0], box_b[0])
+    y1 = max(box_a[1], box_b[1])
+    x2 = min(box_a[2], box_b[2])
+    y2 = min(box_a[3], box_b[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    if inter == 0:
+        return 0.0
+    area_a = max(0, box_a[2] - box_a[0]) * max(0, box_a[3] - box_a[1])
+    area_b = max(0, box_b[2] - box_b[0]) * max(0, box_b[3] - box_b[1])
+    union = area_a + area_b - inter
+    if union <= 0:
+        return 0.0
+    return inter / union
+
+
+def _normalize_answer(ans):
+    """归一化答案: 去空白/括号，统一小写。兼容 "B"/"b"/"(B)"/" B "。"""
+    if ans is None:
+        return None
+    s = str(ans).strip().lower()
+    if s.startswith("(") and s.endswith(")"):
+        s = s[1:-1].strip()
+    return s if s else None
+
+
+def _extract_last_json_obj(s):
+    """从字符串中提取最后一个合法的 JSON 对象（dict）。
+
+    模型输出可能带 <think> 块，直接 json.loads 会失败。
+    扫描所有 {...} 块（含嵌套），逐个 json.loads，
+    返回最后一个成功解析为 dict 的对象。失败返回 None。
+    """
+    if not s:
+        return None
+    candidates = []
+    for m in re.finditer(r"\{.*\}", s, re.DOTALL):
+        try:
+            obj = json.loads(m.group())
+            if isinstance(obj, dict):
+                candidates.append(obj)
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return candidates[-1] if candidates else None
+
+
+def _parse_json_obj(raw):
+    """从字符串或 dict 中解析出 JSON 对象（dict）。失败返回 None。
+
+    GT 通常是纯 JSON，json.loads 直接成功。
+    模型输出带 <think> 块时，用 _extract_last_json_obj 扫描。
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return raw
+    s = str(raw).strip()
+    if not s:
+        return None
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            return obj
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return _extract_last_json_obj(s)
+
+
+# ============================================================
+# 第一类: JSON answer 二值奖励
+# ============================================================
+
+def _parse_gt_answer(ground_truth):
+    """从 ground_truth 中提取 answer。
+
+    ground_truth 期望为 JSON 字符串: {"answer": "B"}
+    兜底: 若是 dict 直接取 answer 键; JSON 损坏时正则抓;
+    若不是 JSON 则把整个字符串当裸答案。
+    """
+    if ground_truth is None:
+        return None
+    if isinstance(ground_truth, dict):
+        return _normalize_answer(ground_truth.get("answer"))
+
+    gt_str = str(ground_truth).strip()
+    if gt_str.startswith("{"):
+        try:
+            obj = json.loads(gt_str)
+            if isinstance(obj, dict) and "answer" in obj:
+                return _normalize_answer(obj["answer"])
+        except (json.JSONDecodeError, ValueError):
+            pass
+        m = re.search(r'"answer"\s*:\s*"([^"]*)"', gt_str)
+        if m:
+            return _normalize_answer(m.group(1))
+        return None
+    return _normalize_answer(gt_str)
+
+
+def _extract_json_answer(solution_str):
+    """从模型输出中提取最终 JSON 的 answer 键。
+
+    模型输出形如: <think>...</think>\n{"answer": "B", "summary": "..."}
+    策略: 扫描所有 {...} 块逐个 json.loads，取最后一个含 answer 键的;
+          兜底正则抓 "answer": "X"。
+    """
+    if not solution_str:
+        return None
+
+    candidates = re.findall(r"\{[^{}]*\}", solution_str, re.DOTALL)
+    last_answer = None
+    for cand in candidates:
+        try:
+            obj = json.loads(cand)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(obj, dict) and "answer" in obj:
+            last_answer = obj["answer"]
+
+    if last_answer is not None:
+        return _normalize_answer(last_answer)
+
+    m = re.findall(r'"answer"\s*:\s*"([^"]*)"', solution_str)
+    if m:
+        return _normalize_answer(m[-1])
+
+    return None
+
+
+def score_json_answer(solution_str, ground_truth):
+    """第一类奖励: JSON answer exact match，二值 0/1。"""
+    gt = _parse_gt_answer(ground_truth)
+    if gt is None:
+        return 0.0
+    pred = _extract_json_answer(solution_str)
+    if pred is None:
+        return 0.0
+    return 1.0 if pred == gt else 0.0
+
+
+# ============================================================
+# 第二类: bbox 匈牙利匹配 IoU 奖励（humanref_cot）
+# ============================================================
+
+def _parse_boxes_from_json(raw):
+    """从 JSON 字符串或 dict 中提取 boxes 列表。
+
+    期望格式: {"boxes": [[x1,y1,x2,y2], ...]}  (纯坐标数组)
+    每个框 clamp 到 [0,1000]。
+    返回 list[list[float]]，解析失败返回 []。
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, dict):
+        obj = raw
+    else:
+        s = str(raw).strip()
+        if not s:
+            return []
+        try:
+            obj = json.loads(s)
+        except (json.JSONDecodeError, ValueError):
+            # 兜底: 正则抓所有 [x,y,x,y] 数组
+            boxes = []
+            for m in re.finditer(r"\[(\d+)[,\s]+(\d+)[,\s]+(\d+)[,\s]+(\d+)\]", s):
+                boxes.append(_clamp_box([int(m.group(i)) for i in (1, 2, 3, 4)]))
+            return boxes
+
+    boxes_raw = obj.get("boxes") if isinstance(obj, dict) else None
+    if not isinstance(boxes_raw, list):
+        return []
+    result = []
+    for b in boxes_raw:
+        if isinstance(b, (list, tuple)) and len(b) == 4:
+            try:
+                result.append(_clamp_box([float(v) for v in b]))
+            except (ValueError, TypeError):
+                continue
+    return result
+
+
+def score_hungarian_iou(solution_str, ground_truth):
+    """第二类奖励: bbox 匈牙利匹配 IoU / max(n, m)，连续值 ∈ [0,1]。
+
+    步骤:
+      1) 从 GT 和模型输出中提取 boxes，clamp 到 [0,1000]
+      2) 构造 n×m IoU 矩阵
+      3) 匈牙利算法求总 IoU 最大的一对一匹配
+      4) reward = Σ IoU(M*) / max(n, m)
+
+    无匹配阈值; GT 或预测为空时返回 0.0。
+    """
+    gt_boxes = _parse_boxes_from_json(ground_truth)
+    pred_boxes = _parse_boxes_from_json(solution_str)
+
+    n = len(gt_boxes)
+    m = len(pred_boxes)
+    if n == 0 or m == 0:
+        return 0.0
+
+    iou_matrix = np.zeros((n, m), dtype=np.float64)
+    for i in range(n):
+        for j in range(m):
+            iou_matrix[i, j] = _iou(gt_boxes[i], pred_boxes[j])
+
+    row_ind, col_ind = linear_sum_assignment(-iou_matrix)
+    matched_iou_sum = float(iou_matrix[row_ind, col_ind].sum())
+
+    return matched_iou_sum / max(n, m)
+
+
+# ============================================================
+# 第三/四类共享: bbox+label 解析、R2/R3/R4 子项、匈牙利匹配
+# ============================================================
+
+CANVAS_SIZE = 1000
+
+# R3 关键词
+LABEL_KEYWORDS = ("add", "delete", "rotate", "replace", "move")
+
+
+def _parse_bbox_entries(raw):
+    """解析 spatial_consistency_bbox / spatial_detection 的 boxes 字段。
+
+    每个元素是 {"bbox": [x1,y1,x2,y2], "label": "..."}。
+    返回 [(bbox_clamped, label_str), ...]，解析失败返回 []。
+
+    模型输出可能带 <think> 块，用 _extract_last_json_obj 提取。
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, dict):
+        obj = raw
+    else:
+        s = str(raw).strip()
+        if not s:
+            return []
+        obj = None
+        try:
+            obj = json.loads(s)
+        except (json.JSONDecodeError, ValueError):
+            pass
+        if obj is None:
+            obj = _extract_last_json_obj(s)
+        if obj is None:
+            return []
+
+    boxes_raw = obj.get("boxes") if isinstance(obj, dict) else None
+    if not isinstance(boxes_raw, list):
+        return []
+    result = []
+    for item in boxes_raw:
+        if not isinstance(item, dict):
+            continue
+        bbox = item.get("bbox")
+        label = item.get("label", "")
+        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+            try:
+                bbox_c = _clamp_box([float(v) for v in bbox])
+            except (ValueError, TypeError):
+                continue
+            result.append((bbox_c, str(label)))
+    return result
+
+
+def _rasterize_union(entries, size=CANVAS_SIZE):
+    """把 entries 里所有框的并集栅格化到 size×size 布尔掩码。
+
+    entries: [(bbox, label), ...]
+    返回 numpy 布尔数组 (size, size)。
+    """
+    mask = np.zeros((size, size), dtype=bool)
+    for bbox, _ in entries:
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        x1, y1 = max(0, min(x1, size)), max(0, min(y1, size))
+        x2, y2 = max(0, min(x2, size)), max(0, min(y2, size))
+        if x2 > x1 and y2 > y1:
+            mask[y1:y2, x1:x2] = True
+    return mask
+
+
+def _score_r2(gt_entries, pred_entries):
+    """R2: GT 框并集 vs 预测框并集 的 IoU（栅格化）。
+
+    空集 vs 空集 → 1.0; 任一为空 → 0.0。
+    """
+    gt_mask = _rasterize_union(gt_entries)
+    pred_mask = _rasterize_union(pred_entries)
+    inter = np.logical_and(gt_mask, pred_mask).sum()
+    union = np.logical_or(gt_mask, pred_mask).sum()
+    if union == 0:
+        return 1.0 if inter == 0 else 0.0
+    return float(inter) / float(union)
+
+
+def _extract_keyword_set(label):
+    """从 label 文本中提取动作关键词集合（词边界匹配）。
+
+    用 \\b 词边界避免子串误判: "remove" 不含 "move"，
+    "added" 不含 "add"，"movement" 不含 "move"。
+    """
+    s = set()
+    for kw in LABEL_KEYWORDS:
+        if re.search(r"\b" + kw + r"\b", label):
+            s.add(kw)
+    return s
+
+
+def _score_r3(gt_entries, pred_entries, matches):
+    """R3: 匈牙利匹配后逐框对 label 关键词【子集召回匹配】，取平均。
+
+    matches: [(gt_idx, pred_idx, iou), ...]
+    对每个匹配对，提取 GT 和 pred 的关键词集合
+    (add/delete/rotate/replace/move)，按【子集召回】规则计分:
+      pred 集合 ⊆ GT 集合 → 得分 = |pred ∩ GT| / |GT|
+        （说少了按召回给部分分，保留梯度信号、降低方差）
+      pred 集合含任何 GT 没有的关键词（说多了）→ 记 0
+        （多报是 reward hacking 方向: 无脑输出全部关键词
+         若只略微扣分，反而成为稳赚策略，故直接归零）
+    边界: GT 关键词集为空 → 该对无法评估，记 0（不给信号）。
+    最终取所有匹配对的平均。无匹配 → 0.0。
+    """
+    if not matches:
+        return 0.0
+    scores = []
+    for gi, pi, iou in matches:
+        gt_label = gt_entries[gi][1].lower()
+        pred_label = pred_entries[pi][1].lower()
+        gt_set = _extract_keyword_set(gt_label)
+        pred_set = _extract_keyword_set(pred_label)
+        if len(gt_set) == 0:
+            # GT 无关键词，无法评估，不给信号
+            scores.append(0.0)
+        elif pred_set <= gt_set:
+            # 说少了按召回给部分分；完全一致时 = 1.0
+            scores.append(len(pred_set) / len(gt_set))
+        else:
+            # 说多了（pred 含 GT 没有的关键词）→ 记 0，堵 hack 捷径
+            scores.append(0.0)
+    return sum(scores) / len(scores)
+
+
+def _count_bracket_vectors(label):
+    """统计 label 中括号内数值向量（2 值或 3 值）的组数。
+
+    用于 R4 格式门控: 预测 label 出现超过一组括号数值向量 → R4=-1。
+    """
+    count = 0
+    for m in re.finditer(r"\(([^)]+)\)", label):
+        parts = re.split(r"[,\s]+", m.group(1).strip())
+        nums = []
+        for p in parts:
+            try:
+                nums.append(float(p))
+            except ValueError:
+                continue
+        if len(nums) in (2, 3):
+            count += 1
+    return count
+
+
+def _extract_direction_vec(label, bbox):
+    """从 label 文本中提取括号内的数值向量，转成 2D 方向。
+
+    两种格式:
+      二值 (x, y): 位置 → 方向 = (x - cx, cy - y)
+                   cx,cy = bbox 中心; 第一维正=右, 第二维正=上
+      三值 (x, y, z): 方向本身 → 取前两维 (x, y)
+    返回 ((dx, dy), n_dims)，n_dims ∈ {2, 3}；无法提取返回 (None, 0)。
+    """
+    m = re.search(r"\(([^)]+)\)", label)
+    if not m:
+        return None, 0
+    parts = re.split(r"[,\s]+", m.group(1).strip())
+    nums = []
+    for p in parts:
+        try:
+            nums.append(float(p))
+        except ValueError:
+            continue
+    if len(nums) == 2:
+        x, y = nums
+        cx = (bbox[0] + bbox[2]) / 2.0
+        cy = (bbox[1] + bbox[3]) / 2.0
+        dx = x - cx
+        dy = cy - y  # 图像 y 向下，取反使正=上
+        return (dx, dy), 2
+    elif len(nums) == 3:
+        return (nums[0], nums[1]), 3
+    return None, 0
+
+
+def _score_r4(gt_entries, pred_entries, matches):
+    """R4: 匈牙利匹配后逐框对方向夹角映射，取平均。
+
+    matches: [(gt_idx, pred_idx, iou), ...]
+
+    格式硬门控（前置）:
+      任一匹配对的预测 label 出现超过一组括号数值向量 → R4=-1
+      （防止模型输出多个括号向量刷分）。
+
+    对每个匹配对:
+      1) 从各自 label 提取方向向量（二值用各自框中心转，三值直接取）
+      2) 夹角映射直接用 cosθ ∈ [-1, 1]（同向=1, 垂直=0, 反向=-1）
+      3) 维度不一致处理:
+         GT 二值 + 预测三值 → 不罚（预测多输出深度不罚，砍第三维算夹角）
+         GT 三值 + 预测二值 → 扣 0.2（预测丢失 GT 已有的深度），不 clamp 下限
+    任一 label 无括号数值 → 该对记 0。最终取所有匹配对的平均。
+    无匹配 → 0.0。
+    """
+    if not matches:
+        return 0.0
+
+    # 格式硬门控: 预测 label 出现超过一组括号数值向量 → R4=-1
+    for gi, pi, iou in matches:
+        pred_label = pred_entries[pi][1]
+        if _count_bracket_vectors(pred_label) > 1:
+            return -1.0
+
+    scores = []
+    for gi, pi, iou in matches:
+        gt_vec, gt_ndim = _extract_direction_vec(gt_entries[gi][1], gt_entries[gi][0])
+        pred_vec, pred_ndim = _extract_direction_vec(pred_entries[pi][1], pred_entries[pi][0])
+        if gt_vec is None or pred_vec is None:
+            scores.append(0.0)
+            continue
+        norm = np.linalg.norm(gt_vec) * np.linalg.norm(pred_vec)
+        if norm < 1e-12:
+            scores.append(0.0)
+            continue
+        cos_theta = np.dot(gt_vec, pred_vec) / norm
+        cos_theta = max(-1.0, min(1.0, float(cos_theta)))
+        # 夹角映射直接用 cosθ ∈ [-1, 1]
+        angle_score = cos_theta
+        # GT 三值 + 预测二值 → 丢失深度信息，扣 0.2（不 clamp 下限）
+        if gt_ndim == 3 and pred_ndim == 2:
+            angle_score -= 0.2
+        scores.append(angle_score)
+    return sum(scores) / len(scores)
+
+
+def _hungarian_match(gt_entries, pred_entries):
+    """对 GT 和 pred 的框做匈牙利匹配（按 IoU 最大化）。
+
+    返回 [(gt_idx, pred_idx, iou), ...]。
+    """
+    n = len(gt_entries)
+    m = len(pred_entries)
+    if n == 0 or m == 0:
+        return []
+    iou_matrix = np.zeros((n, m), dtype=np.float64)
+    for i in range(n):
+        for j in range(m):
+            iou_matrix[i, j] = _iou(gt_entries[i][0], pred_entries[j][0])
+    row_ind, col_ind = linear_sum_assignment(-iou_matrix)
+    return [(int(r), int(c), float(iou_matrix[r, c]))
+            for r, c in zip(row_ind, col_ind)]
+
+
+# ============================================================
+# 第三类: spatial_consistency_bbox 组合奖励
+# ============================================================
+
+def score_spatial_consistency_bbox(solution_str, ground_truth):
+    """第三类奖励: spatial_consistency_bbox 组合奖励。
+
+    GT boxes 为空（正例）:
+      C=0 → R=0;  C=1 且预测空 → 1.0;  C=1 且预测非空 → 0.2
+    GT boxes 非空（负例）:
+      R = C × (0.2 + 0.7×R2 + 0.1×R3)
+
+    注: R4（方向夹角）仍停用（疑似 reward hacking），代码保留，
+        需要时恢复下方注释即可（恢复时把权重改回
+        0.2 + 0.65×R2 + 0.1×R3 + 0.05×R4 的组合）。
+    """
+    # C: answer 门控
+    gt_obj = _parse_json_obj(ground_truth)
+    pred_obj = _parse_json_obj(solution_str)
+    gt_answer = _normalize_answer(gt_obj.get("answer") if gt_obj else None)
+    pred_answer = _normalize_answer(pred_obj.get("answer") if pred_obj else None)
+    c = 1.0 if (gt_answer is not None and pred_answer is not None
+                and gt_answer == pred_answer) else 0.0
+    if c == 0.0:
+        return 0.0
+
+    # 解析 boxes entries
+    gt_entries = _parse_bbox_entries(ground_truth)
+    pred_entries = _parse_bbox_entries(solution_str)
+
+    # GT boxes 为空（正例）
+    if len(gt_entries) == 0:
+        return 1.0 if len(pred_entries) == 0 else 0.2
+
+    # GT boxes 非空（负例）: 走公式
+    r2 = _score_r2(gt_entries, pred_entries)
+    matches = _hungarian_match(gt_entries, pred_entries)
+    r3 = _score_r3(gt_entries, pred_entries, matches)
+    # --- R4 暂时注释（疑似 reward hacking），之后可能恢复 ---
+    # r4 = _score_r4(gt_entries, pred_entries, matches)
+    # return c * (0.2 + 0.65 * r2 + 0.1 * r3 + 0.05 * r4)
+    return c * (0.2 + 0.7 * r2 + 0.1 * r3)
+
+
+# ============================================================
+# 第四类: spatial_detection 组合奖励
+# ============================================================
+
+def score_spatial_detection(solution_str, ground_truth):
+    """第四类奖励: spatial_detection 组合奖励（全负例，无门控）。
+
+    R = 0.85×R2 + 0.15×R3
+    GT 结构同第三类，但无 C 门控、无正例空框分支。
+
+    注: R4（方向夹角）仍停用（疑似 reward hacking），代码保留，
+        需要时恢复下方注释即可（恢复时把权重改回
+        0.8×R2 + 0.15×R3 + 0.05×R4 的组合）。
+    """
+    gt_entries = _parse_bbox_entries(ground_truth)
+    pred_entries = _parse_bbox_entries(solution_str)
+    r2 = _score_r2(gt_entries, pred_entries)
+    matches = _hungarian_match(gt_entries, pred_entries)
+    r3 = _score_r3(gt_entries, pred_entries, matches)
+    # --- R4 暂时注释（疑似 reward hacking），之后可能恢复 ---
+    # r4 = _score_r4(gt_entries, pred_entries, matches)
+    # return 0.8 * r2 + 0.15 * r3 + 0.05 * r4
+    return 0.85 * r2 + 0.15 * r3
+
+
+# ============================================================
+# 分类路由（按 data_source 分发）
+# ============================================================
+
+JSON_ANSWER_SOURCES = {
+    "spatial_consistency_pos",
+    "spatial_consistency_neg",
+    # 其余第一类数据源（run_rl1.sh 中使用）
+    "vst_caption",
+    "spatialscore",
+    "spatialcorpus_vi",
+    "viewspatial",
+    "vst_oor",
+}
+
+HUNGARIAN_IOU_SOURCES = {
+    "humanref_cot",
+}
+
+SPATIAL_CONSISTENCY_BBOX_SOURCES = {
+    "spatial_consistency_bbox_pos",
+    "spatial_consistency_bbox_neg",
+}
+
+SPATIAL_DETECTION_SOURCES = {
+    "spatial_detection",
+}
+
+KNOWN_SOURCES = (JSON_ANSWER_SOURCES | HUNGARIAN_IOU_SOURCES
+                 | SPATIAL_CONSISTENCY_BBOX_SOURCES | SPATIAL_DETECTION_SOURCES)
+
+
+def compute_score(data_source, solution_str, ground_truth, extra_info=None):
+    """verl 标准 reward function 入口。按 data_source 路由到对应奖励类别。
+
+    Args:
+        data_source: 数据源标识
+        solution_str: 模型生成的完整回复
+        ground_truth: 标准答案（JSON 字符串）
+        extra_info: 额外元数据 dict
+
+    Returns:
+        float: 标量 reward
+
+    Raises:
+        ValueError: data_source 不在任何已知集合中。
+            不做静默兜底——历史上兜底到第一类曾导致 bbox 任务被
+            悄悄降级为纯 answer 匹配而无人察觉。宁可当场报错。
+    """
+    if data_source in SPATIAL_DETECTION_SOURCES:
+        return score_spatial_detection(solution_str, ground_truth)
+
+    if data_source in SPATIAL_CONSISTENCY_BBOX_SOURCES:
+        return score_spatial_consistency_bbox(solution_str, ground_truth)
+
+    if data_source in HUNGARIAN_IOU_SOURCES:
+        return score_hungarian_iou(solution_str, ground_truth)
+
+    if data_source in JSON_ANSWER_SOURCES:
+        return score_json_answer(solution_str, ground_truth)
+
+    # 未匹配的 data_source: 直接报错，禁止静默兜底
+    raise ValueError(
+        f"未知的 data_source: {data_source!r}，不在任何奖励路由集合中。"
+        f"已知值: {sorted(KNOWN_SOURCES)}。"
+        f"请检查 parquet 的 data_source 列与 reward 路由键名是否一致。"
+    )
+
+
+# ============================================================
+# 本地测试
+# ============================================================
+if __name__ == "__main__":
+    think = "<think>\n分析图片中的人物位置关系...\n</think>\n"
+    good_json = '{"answer": "B", "summary": "inconsistent orientation."}'
+
+    # --- 第一类测试 ---
+    print("=== 第一类: JSON answer 二值奖励 ===\n")
+    cases_1 = [
+        (think + good_json, '{"answer": "B"}', 1.0, "标准格式答对"),
+        (think + good_json, '{"answer": "A"}', 0.0, "标准格式答错"),
+        ('{"answer": "A"}', '{"answer": "A"}', 1.0, "无 think 直接 JSON"),
+        ('{"answer": "a"}', '{"answer": "A"}', 1.0, "小写答案"),
+        ('{"answer": "(B)"}', '{"answer": "B"}', 1.0, "答案带括号"),
+        ('{"answer":"C"}', '{"answer": "C"}', 1.0, "紧凑 JSON"),
+        ('{"answer": "A"} 然后 {"answer": "C"}',
+         '{"answer": "C"}', 1.0, "多个 JSON 取最后一个"),
+        ('{"answer": "yes"}', '{"answer": "yes"}', 1.0, "yes 判断题"),
+        ('{"answer": "no"}', '{"answer": "yes"}', 0.0, "yes/no 答错"),
+        ('{"answer": "B", "summary": "截断',
+         '{"answer": "B"}', 1.0, "JSON 损坏但 answer 可抓"),
+        ("我觉得是第二个", '{"answer": "B"}', 0.0, "无 JSON 输出"),
+        ("", '{"answer": "B"}', 0.0, "空输出"),
+        ('{"summary": "无 answer"}', '{"answer": "B"}', 0.0, "缺 answer 键"),
+        ('{"answer": "B"}', "B", 1.0, "GT 是裸答案"),
+    ]
+    passed = 0
+    for i, (sol, gt, exp, desc) in enumerate(cases_1):
+        score = compute_score("spatialscore", sol, gt)
+        status = "PASS" if abs(score - exp) < 1e-6 else "FAIL"
+        if status == "PASS":
+            passed += 1
+        print(f"  [{status}] {i+1:2d}. {desc}: reward={score:.1f} (exp {exp:.1f})")
+
+    # --- 第二类测试 ---
+    print("\n=== 第二类: bbox 匈牙利匹配 IoU 奖励 ===\n")
+    cases_2 = [
+        ('{"boxes": [[0,0,100,100]]}',
+         '{"boxes": [[0,0,100,100]]}', 1.0, "单框完全匹配"),
+        ('{"boxes": [[0,0,100,100]]}',
+         '{"boxes": [[50,50,150,150]]}', None, "单框部分重叠"),
+        ('{"boxes": [[0,0,100,100]]}',
+         '{"boxes": [[200,200,300,300]]}', 0.0, "单框不重叠"),
+        ('{"boxes": [[0,0,100,100],[200,200,300,300]]}',
+         '{"boxes": [[0,0,100,100],[200,200,300,300]]}', 1.0, "双框完全匹配"),
+        ('{"boxes": [[0,0,100,100]]}',
+         '{"boxes": [[0,0,100,100],[200,200,300,300]]}', 0.5, "漏检一个框"),
+        ('{"boxes": [[0,0,100,100],[200,200,300,300]]}',
+         '{"boxes": [[0,0,100,100]]}', 0.5, "多报一个框"),
+        ('{"boxes": []}', '{"boxes": [[0,0,100,100]]}', 0.0, "预测为空"),
+        ('{"boxes": [[0,0,100,100]]}', '{"boxes": []}', 0.0, "GT为空"),
+        ("没有输出框", '{"boxes": [[0,0,100,100]]}', 0.0, "无 JSON 输出"),
+        ('{"boxes": [[-10,-10,110,110]]}',
+         '{"boxes": [[0,0,100,100]]}', None, "越界 clamp"),
+        ('{"boxes": [[0,0,100,100],[200,200,300,300],[400,400,500,500]]}',
+         '{"boxes": [[0,0,100,100],[200,200,300,300]]}', None, "3框中2个匹配"),
+    ]
+    for i, (sol, gt, exp, desc) in enumerate(cases_2):
+        score = compute_score("humanref_cot", sol, gt)
+        if exp is not None:
+            status = "PASS" if abs(score - exp) < 1e-6 else "FAIL"
+            if status == "PASS":
+                passed += 1
+            print(f"  [{status}] {i+1:2d}. {desc}: reward={score:.4f} (exp {exp:.4f})")
+        else:
+            print(f"  [INFO] {i+1:2d}. {desc}: reward={score:.4f}")
+
+    # --- 第三类测试 (R = C × (0.2 + 0.7×R2 + 0.1×R3), R4 已注释) ---
+    print("\n=== 第三类: spatial_consistency_bbox 组合奖励 ===\n")
+    scb_think = "<think>\n分析...\n</think>\n"
+    gt_pos = '{"answer": "A", "summary": "consistent", "boxes": []}'
+    # 负例 GT: bbox [0,0,100,100]
+    gt_neg = ('{"answer": "B", "summary": "inconsistent", '
+              '"boxes": [{"bbox": [0,0,100,100], "label": "move (100, 50)"}]}')
+    # 负例 GT（双关键词）: 用于测试 R3 说少给部分分
+    gt_neg2 = ('{"answer": "B", "summary": "inconsistent", '
+               '"boxes": [{"bbox": [0,0,100,100], "label": "move and rotate (100, 50)"}]}')
+    SCB_POS = "spatial_consistency_bbox_pos"
+    SCB_NEG = "spatial_consistency_bbox_neg"
+    cases_3 = [
+        (SCB_NEG, scb_think + '{"answer": "A", "boxes": []}', gt_neg, 0.0, "C=0 门控拦截"),
+        (SCB_POS, scb_think + '{"answer": "A", "boxes": []}', gt_pos, 1.0, "正例预测空=满分"),
+        (SCB_POS, scb_think + '{"answer": "A", "boxes": [{"bbox":[0,0,10,10],"label":""}]}',
+         gt_pos, 0.2, "正例预测非空=0.2"),
+        # 负例完美匹配: R2=1, R3=1 → R = 0.2+0.7+0.1 = 1.0
+        (SCB_NEG, scb_think + '{"answer": "B", "boxes": [{"bbox": [0,0,100,100], "label": "move (100, 50)"}]}',
+         gt_neg, 1.0, "负例完美匹配=1.0"),
+        # 负例部分重叠: R2 = 2500/17500 = 1/7, R3=1(move⊆move)
+        #   → R = 0.2 + 0.7/7 + 0.1 = 0.4
+        (SCB_NEG, scb_think + '{"answer": "B", "boxes": [{"bbox": [50,50,150,150], "label": "move"}]}',
+         gt_neg, 0.4, "负例部分重叠"),
+        # 负例完全不重叠: R2=0, R3=1 → R = 0.2 + 0.1 = 0.3
+        (SCB_NEG, scb_think + '{"answer": "B", "boxes": [{"bbox": [500,500,600,600], "label": "move"}]}',
+         gt_neg, 0.3, "负例不重叠(label对)=0.3"),
+        # R3 说多了: pred 含 GT 没有的关键词 delete → R3=0
+        #   R = 0.2 + 0.7×1 + 0 = 0.9
+        (SCB_NEG, scb_think + '{"answer": "B", "boxes": [{"bbox": [0,0,100,100], "label": "move and delete"}]}',
+         gt_neg, 0.9, "R3说多了记0"),
+        # R3 说少了: GT={move,rotate}, pred={move} → R3=1/2
+        #   R = 0.2 + 0.7×1 + 0.1×0.5 = 0.95
+        (SCB_NEG, scb_think + '{"answer": "B", "boxes": [{"bbox": [0,0,100,100], "label": "move"}]}',
+         gt_neg2, 0.95, "R3说少了按召回给半分"),
+        # R3 无脑全输出（hack 试探）: pred 输出全部 5 个关键词 → R3=0
+        #   R = 0.2 + 0.7×1 + 0 = 0.9
+        (SCB_NEG, scb_think + '{"answer": "B", "boxes": [{"bbox": [0,0,100,100], "label": "add delete rotate replace move"}]}',
+         gt_neg, 0.9, "R3无脑全输出记0(堵hack)"),
+    ]
+    for i, (ds, sol, gt, exp, desc) in enumerate(cases_3):
+        score = compute_score(ds, sol, gt)
+        if exp is not None:
+            status = "PASS" if abs(score - exp) < 1e-6 else "FAIL"
+            if status == "PASS":
+                passed += 1
+            print(f"  [{status}] {i+1:2d}. {desc}: reward={score:.4f} (exp {exp:.4f})")
+        else:
+            print(f"  [INFO] {i+1:2d}. {desc}: reward={score:.4f}")
+
+    # --- 第四类测试 (R = 0.85×R2 + 0.15×R3, R4 已注释) ---
+    print("\n=== 第四类: spatial_detection 组合奖励 ===\n")
+    sd_gt = ('{"answer": "B", "summary": "inconsistent", '
+             '"boxes": [{"bbox": [0,0,100,100], "label": "move (100, 50)"}]}')
+    cases_4 = [
+        # 完美匹配: R2=1, R3=1 → R = 0.85+0.15 = 1.0
+        ('{"answer": "B", "boxes": [{"bbox": [0,0,100,100], "label": "move (100, 50)"}]}',
+         sd_gt, 1.0, "完美匹配=1.0"),
+        # 部分重叠: R2=1/7, R3=1 → R = 0.85/7 + 0.15 ≈ 0.2714
+        ('{"answer": "B", "boxes": [{"bbox": [50,50,150,150], "label": "move"}]}',
+         sd_gt, 0.85 / 7 + 0.15, "部分重叠"),
+        # 完全不重叠: R2=0, R3=1 → R = 0.15
+        ('{"answer": "B", "boxes": [{"bbox": [500,500,600,600], "label": "move"}]}',
+         sd_gt, 0.15, "不重叠(label对)=0.15"),
+        # 预测无框: R2=0, 无匹配 → R3=0 → R=0
+        ('{"answer": "B", "boxes": []}', sd_gt, 0.0, "预测无框=0"),
+        # R3 说多了: pred 含 delete → R3=0 → R = 0.85×1 = 0.85
+        ('{"answer": "B", "boxes": [{"bbox": [0,0,100,100], "label": "move and delete"}]}',
+         sd_gt, 0.85, "R3说多了记0"),
+    ]
+    for i, (sol, gt, exp, desc) in enumerate(cases_4):
+        score = compute_score("spatial_detection", sol, gt)
+        if exp is not None:
+            status = "PASS" if abs(score - exp) < 1e-6 else "FAIL"
+            if status == "PASS":
+                passed += 1
+            print(f"  [{status}] {i+1:2d}. {desc}: reward={score:.4f} (exp {exp:.4f})")
+        else:
+            print(f"  [INFO] {i+1:2d}. {desc}: reward={score:.4f}")
+
+    # --- 路由测试 ---
+    print("\n=== data_source 路由测试 ===\n")
+    route_cases = [
+        ("spatialscore", think + good_json, '{"answer": "B"}', 1.0),
+        ("spatial_consistency_pos", think + good_json, '{"answer": "B"}', 1.0),
+        ("spatial_consistency_neg", think + good_json, '{"answer": "B"}', 1.0),
+        ("vst_caption", think + good_json, '{"answer": "B"}', 1.0),
+        ("viewspatial", think + good_json, '{"answer": "B"}', 1.0),
+        ("vst_oor", think + good_json, '{"answer": "B"}', 1.0),
+        ("spatialcorpus_vi", think + good_json, '{"answer": "B"}', 1.0),
+        ("humanref_cot",
+         '{"boxes": [[0,0,100,100]]}',
+         '{"boxes": [[0,0,100,100]]}', 1.0),
+        ("spatial_consistency_bbox_pos",
+         scb_think + '{"answer": "A", "boxes": []}',
+         gt_pos, 1.0),
+        # R2=1, R3=1(move⊆move) → R = 0.85+0.15 = 1.0
+        ("spatial_detection",
+         '{"answer": "B", "boxes": [{"bbox": [0,0,100,100], "label": "move (50, 50)"}]}',
+         sd_gt, 1.0),
+    ]
+    for ds, sol, gt, exp in route_cases:
+        score = compute_score(ds, sol, gt)
+        if exp is not None:
+            status = "PASS" if abs(score - exp) < 1e-6 else "FAIL"
+            if status == "PASS":
+                passed += 1
+            print(f"  [{status}] {ds}: reward={score:.4f} (exp {exp:.4f})")
+        else:
+            print(f"  [INFO] {ds}: reward={score:.4f}")
+
+    # --- 未知 data_source 必须报错（禁止静默兜底）---
+    print("\n=== 未知 data_source 报错测试 ===\n")
+    unknown_cases = [
+        "spatial_consistency",          # 旧键名（已改名，不应再静默走第一类）
+        "spatial_consistency_bbox",     # 旧键名
+        "typo_source",                  # 拼写错误
+        "",                             # 空值
+    ]
+    for ds in unknown_cases:
+        try:
+            score = compute_score(ds, think + good_json, '{"answer": "B"}')
+            print(f"  [FAIL] {ds!r}: 未报错，返回 {score}（静默兜底！）")
+        except ValueError as e:
+            passed += 1
+            print(f"  [PASS] {ds!r}: 正确抛出 ValueError")
+
+    total = (len(cases_1)
+             + sum(1 for _, _, e, _ in cases_2 if e is not None)
+             + sum(1 for _, _, _, e, _ in cases_3 if e is not None)
+             + sum(1 for _, _, e, _ in cases_4 if e is not None)
+             + sum(1 for _, _, e, _ in route_cases if e is not None)
+             + len(unknown_cases))
+    print(f"\n结果: {passed}/{total} 通过")
