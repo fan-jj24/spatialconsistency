@@ -10,8 +10,8 @@ R4 奖励模型: Qwen3.5-0.8B summary 一致性校验。
   - 模型单例: 全局只加载一次，进程内复用（verl reward worker 常驻）。
   - 下载: ModelScope snapshot_download（sandbox 内 HF 不可达）。
   - CPU 推理: dtype=bfloat16, device_map="cpu"。
-  - 批处理: 支持单条和批量调用，批量时统一 left-padding。
-  - 降级: 模型不可用时返回 -1.0，调用方自行降级处理。
+  - 批处理: 支持单条和批量调用，批量时统一 right-padding。
+  - 异常处理: 模型加载或推理失败时直接抛出异常，中断训练。
   - 线程安全: 加载和推理各用一把锁，避免 verl 多线程 reward 并发问题。
 
 调用方式:
@@ -23,9 +23,10 @@ R4 奖励模型: Qwen3.5-0.8B summary 一致性校验。
     scores = rm.score_summaries([(pred1, gt1), (pred2, gt2)])
 
 打分方案: 3 档分类 + forward logits 加权
-  让模型从 A/B/C 三个选项中选一个，只做一次 forward（不 generate），
-  取 last position 的 logits，对 A/B/C 三个 token 做 3-way softmax，
-  最终分数 = Σ(档位分数 × P(档位))。
+  让模型从 A/B/C 三个选项中选一个，只做一次 backbone forward
+  （不 generate，也不生成完整词表 logits），取最后有效位置的 hidden
+  state，仅与 A/B/C 对应的 lm_head 权重行做矩阵乘法，再对这些候选
+  logits 做 3-way softmax。
 
   forward 比 generate 更好: 确定性，无采样噪声，不会两次结果不一致，
   且只需一次 forward，速度更快。
@@ -72,6 +73,7 @@ import logging
 from typing import Optional, List, Tuple
 
 import torch
+import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +128,10 @@ class RewardModel:
         self._infer_lock = threading.Lock()
         self._loaded = False
         self._choice_token_ids = None  # {"A": [id, ...], "B": [...], "C": [...]}
+        self._backbone = None
+        self._choice_token_columns = None
+        self._choice_head_weight = None
+        self._choice_head_bias = None
 
     def _ensure_loaded(self):
         """延迟加载模型（线程安全，只加载一次）。
@@ -196,10 +202,14 @@ class RewardModel:
 
                 # 预计算 A/B/C 的 token ids（严格验证）
                 self._choice_token_ids = self._get_choice_token_ids()
-                if not self._choice_token_ids:
+                if any(
+                    not self._choice_token_ids[letter]
+                    for letter in CHOICE_LETTERS
+                ):
                     raise RuntimeError(
                         "Cannot find valid choice token ids for A/B/C"
                     )
+                self._prepare_choice_head()
 
                 self._loaded = True
                 logger.info(
@@ -235,8 +245,47 @@ class RewardModel:
                 # 检查解码结果是否就是该字母（允许大小写差异）
                 if decoded.strip().lower() == letter.lower():
                     ids.add(tid)
-            result[letter] = list(ids)
+            result[letter] = sorted(ids)
         return result
+
+    def _prepare_choice_head(self):
+        """只抽取 A/B/C token 对应的输出层参数。
+
+        后续推理直接调用 backbone 获取 hidden state，再与这些权重行相乘，
+        避免构造 ``batch × sequence × vocabulary`` 的完整 logits。
+        """
+        self._backbone = self._model.base_model
+        if self._backbone is self._model:
+            raise RuntimeError("Cannot locate the causal LM backbone")
+
+        lm_head = self._model.get_output_embeddings()
+        if lm_head is None or not hasattr(lm_head, "weight"):
+            raise RuntimeError("Cannot locate lm_head weights")
+
+        unique_token_ids = []
+        token_id_to_column = {}
+        self._choice_token_columns = {}
+        for letter in CHOICE_LETTERS:
+            columns = []
+            for token_id in self._choice_token_ids[letter]:
+                if token_id not in token_id_to_column:
+                    token_id_to_column[token_id] = len(unique_token_ids)
+                    unique_token_ids.append(token_id)
+                columns.append(token_id_to_column[token_id])
+            self._choice_token_columns[letter] = columns
+
+        index = torch.tensor(unique_token_ids, device=lm_head.weight.device)
+        self._choice_head_weight = lm_head.weight.index_select(0, index).detach()
+        if getattr(lm_head, "bias", None) is not None:
+            self._choice_head_bias = lm_head.bias.index_select(0, index).detach()
+
+    def _hidden_to_choice_logits(self, last_hidden: torch.Tensor) -> torch.Tensor:
+        """把最后有效位置的 hidden state 映射为候选 token logits。"""
+        return F.linear(
+            last_hidden,
+            self._choice_head_weight,
+            self._choice_head_bias,
+        )
 
     def _build_prompt(self, pred_summary: str, gt_summary: str) -> str:
         """构建 chat 格式的 prompt。"""
@@ -252,61 +301,66 @@ class RewardModel:
         )
         return text
 
-    def _logits_to_score(self, last_logits: torch.Tensor) -> float:
-        """从 last position 的 logits 计算 3 档加权分数。
+    def _choice_logits_to_scores(
+        self, choice_token_logits: torch.Tensor
+    ) -> List[float]:
+        """从 A/B/C 候选 token logits 计算每条输入的加权分数。
 
         取 A/B/C 各自所有 token id 的 logits 最大值，
         转 float32 后做 3-way softmax（bfloat16 精度不足，
         会导致 P(A)≈1 时出现 1.0003 > 1 的溢出），
         最终分数 = Σ(档位分数 × P(档位))。
         """
-        # 收集每个选项的 logit（取该选项所有 token id 中的最大值）
+        if choice_token_logits.ndim == 1:
+            choice_token_logits = choice_token_logits.unsqueeze(0)
+
+        # 每个选项取其所有 token 变体中的最大 logit
         choice_logits = []
         for letter in CHOICE_LETTERS:
-            ids = self._choice_token_ids[letter]
-            if not ids:
-                choice_logits.append(torch.tensor(-1e9, dtype=torch.float32))
-            else:
-                choice_logits.append(last_logits[ids].max().to(torch.float32))
+            columns = self._choice_token_columns[letter]
+            choice_logits.append(
+                choice_token_logits[:, columns].max(dim=1).values
+            )
 
-        logits_tensor = torch.stack(choice_logits)  # (3,) float32
-        probs = torch.softmax(logits_tensor, dim=0)  # (3,) float32
+        logits_tensor = torch.stack(choice_logits, dim=1).to(torch.float32)
+        probs = torch.softmax(logits_tensor, dim=1)
 
         # 加权分数 = Σ(档位分数 × P(档位))
         scores_tensor = torch.tensor(
             [CHOICE_SCORES[letter] for letter in CHOICE_LETTERS],
             dtype=torch.float32,
+            device=probs.device,
         )
-        expected_score = float((probs * scores_tensor).sum().item())
-        return expected_score
+        expected_scores = (probs * scores_tensor).sum(dim=1)
+        return expected_scores.cpu().tolist()
 
     def score_summary(self, pred_summary: str, gt_summary: str) -> float:
         """校验单条 summary 一致性。
 
-        3 档分类 forward 方案: 一次 forward，取 A/B/C 的 logits
-        做 softmax，加权计算分数。
+        3 档分类 forward 方案: 一次 backbone forward，只计算 A/B/C
+        token 的 logits，做 softmax 后加权计算分数。
 
         Returns:
             float ∈ [0, 1]: 加权分数 = 1.0×P(A) + 0.5×P(B) + 0.0×P(C)。
-            -1.0: 模型不可用（调用方降级）。
         """
         if not pred_summary or not gt_summary:
             return 0.0
-        try:
-            self._ensure_loaded()
-        except Exception:
-            return -1.0
+        self._ensure_loaded()
 
         prompt = self._build_prompt(pred_summary, gt_summary)
         inputs = self._tokenizer(prompt, return_tensors="pt")
 
         with self._infer_lock:
             with torch.no_grad():
-                outputs = self._model(**inputs)
-                logits = outputs.logits  # (1, seq_len, vocab_size)
-                last_logits = logits[0, -1, :]  # (vocab_size,)
+                outputs = self._backbone(
+                    **inputs,
+                    use_cache=False,
+                    return_dict=True,
+                )
+                last_hidden = outputs.last_hidden_state[:, -1, :]
+                choice_logits = self._hidden_to_choice_logits(last_hidden)
 
-        return self._logits_to_score(last_logits)
+        return self._choice_logits_to_scores(choice_logits)[0]
 
     def score_summaries(
         self, pairs: List[Tuple[str, str]]
@@ -316,19 +370,17 @@ class RewardModel:
         使用 right-padding + batch forward。right-padding 把 padding
         token 放在序列末尾，不污染 DeltaNet 的递归状态（left-padding
         会把 padding 放在前面，线性注意力的递归状态从头被污染）。
-        用 attention_mask 找每个序列的最后一个有效 token 位置。
+        用 attention_mask 找每个序列的最后一个有效 token 位置，只对
+        这些位置计算 A/B/C token 的 logits，不生成完整词表 logits。
 
         Args:
             pairs: [(pred_summary, gt_summary), ...]
         Returns:
-            [float, ...]: 每对的加权分数，模型不可用时全 -1.0。
+            [float, ...]: 每对的加权分数。
         """
         if not pairs:
             return []
-        try:
-            self._ensure_loaded()
-        except Exception:
-            return [-1.0] * len(pairs)
+        self._ensure_loaded()
 
         # 构建所有 prompt
         prompts = [self._build_prompt(p, g) for p, g in pairs]
@@ -343,19 +395,22 @@ class RewardModel:
 
         with self._infer_lock:
             with torch.no_grad():
-                outputs = self._model(**encoded)
-                logits = outputs.logits  # (batch, seq_len, vocab_size)
+                outputs = self._backbone(
+                    **encoded,
+                    use_cache=False,
+                    return_dict=True,
+                )
+                hidden_states = outputs.last_hidden_state
                 # right-padding: 最后一个有效 token 是 attention_mask
                 # 中最后一个 1 的位置（不是 seq_len-1，因为后面是 padding）
                 attention_mask = encoded["attention_mask"]
-                # 找每个序列最后一个有效位置
-                seq_lengths = attention_mask.sum(dim=1) - 1  # (batch,)
-
-                scores = []
-                for i in range(logits.size(0)):
-                    last_idx = int(seq_lengths[i].item())
-                    last_logits = logits[i, last_idx, :]
-                    scores.append(self._logits_to_score(last_logits))
+                seq_lengths = attention_mask.sum(dim=1) - 1
+                batch_indices = torch.arange(
+                    hidden_states.size(0), device=hidden_states.device
+                )
+                last_hidden = hidden_states[batch_indices, seq_lengths, :]
+                choice_logits = self._hidden_to_choice_logits(last_hidden)
+                scores = self._choice_logits_to_scores(choice_logits)
 
         return scores
 
@@ -383,7 +438,6 @@ def score_summary(pred_summary: str, gt_summary: str) -> float:
 
     Returns:
         float ∈ [0, 1]: 加权分数 = 1.0×P(A) + 0.5×P(B) + 0.0×P(C)。
-        -1.0: 模型不可用。
     """
     return get_reward_model().score_summary(pred_summary, gt_summary)
 
@@ -457,36 +511,162 @@ if __name__ == "__main__":
         print(f"  pair {i+1}: {s:.4f}")
     print(f"  批量总耗时: {t1-t0:.2f}s ({(t1-t0)/len(pairs):.2f}s/条)")
 
-    # 128 样本批量测试
-    print("\n--- 128 样本批量 ---")
+    # 128 样本批量测试。每条都带人工标注的三档 GT：
+    # 1.0=同一变化，0.5=同类变化但细节不同，0.0=不同变化。
+    print("\n--- 128 样本批量（含三档 GT）---")
     import random
-    random.seed(42)
-    templates_pred = [
-        "The person moved from left to right.",
-        "The background changed significantly.",
-        "A person shifted towards the right side.",
-        "The cat sat on the mat.",
-        "The object rotated 90 degrees clockwise.",
-        "A new object was added to the scene.",
-        "The person moved forward.",
-        "The lighting changed from bright to dark.",
+
+    labeled_templates = [
+        # A / 1.0: 同一变化（允许同义改写）
+        ("The person moved from left to right.",
+         "The person moved from left to right.", 1.0),
+        ("A person shifted towards the right side.",
+         "The person moved from left to right.", 1.0),
+        ("The ball traveled from right to left.",
+         "The ball moved leftward.", 1.0),
+        ("The box was moved upward.",
+         "The box shifted toward the top.", 1.0),
+        ("The bicycle moved downward.",
+         "The bicycle shifted toward the bottom.", 1.0),
+        ("The object rotated 90 degrees clockwise.",
+         "The object made a clockwise quarter-turn.", 1.0),
+        ("The sign turned counterclockwise.",
+         "The sign rotated in the counterclockwise direction.", 1.0),
+        ("A red car was added to the scene.",
+         "A red car appeared in the scene.", 1.0),
+        ("The cup was removed from the table.",
+         "The cup disappeared from the table.", 1.0),
+        ("The background changed from bright to dark.",
+         "The background became darker.", 1.0),
+        ("The person became larger.",
+         "The size of the person increased.", 1.0),
+        ("The blue square became smaller.",
+         "The blue square decreased in size.", 1.0),
+        ("A dog appeared beside the chair.",
+         "A dog was added next to the chair.", 1.0),
+        ("The camera zoomed in on the building.",
+         "The view moved closer to the building.", 1.0),
+        ("The lamp moved behind the sofa.",
+         "The lamp was shifted to the back of the sofa.", 1.0),
+
+        # B / 0.5: 变化类型相同，但方向、对象、幅度或细节不同
+        ("The person moved from right to left.",
+         "The person moved from left to right.", 0.5),
+        ("The box moved downward.",
+         "The box moved upward.", 0.5),
+        ("The ball moved to the right.",
+         "The cube moved to the right.", 0.5),
+        ("The object rotated counterclockwise.",
+         "The object rotated clockwise.", 0.5),
+        ("The wheel rotated 180 degrees clockwise.",
+         "The wheel rotated 90 degrees clockwise.", 0.5),
+        ("A chair was added to the room.",
+         "A table was added to the room.", 0.5),
+        ("The plate was removed from the table.",
+         "The cup was removed from the table.", 0.5),
+        ("The background changed from dark to bright.",
+         "The background changed from bright to dark.", 0.5),
+        ("The person became smaller.",
+         "The person became larger.", 0.5),
+        ("The car moved a short distance to the right.",
+         "The car moved far to the right.", 0.5),
+        ("The triangle moved to the upper-left corner.",
+         "The triangle moved to the lower-right corner.", 0.5),
+        ("The camera zoomed out from the building.",
+         "The camera zoomed in on the building.", 0.5),
+        ("The book moved in front of the vase.",
+         "The book moved behind the vase.", 0.5),
+        ("A small dog appeared beside the chair.",
+         "A large dog appeared beside the chair.", 0.5),
+        ("The person moved right.",
+         "The person moved right and the background became dark.", 0.5),
+
+        # C / 0.0: 变化类型不同或没有描述同一变化
+        ("The background changed significantly.",
+         "The person moved from left to right.", 0.0),
+        ("The object rotated clockwise.",
+         "The object moved upward.", 0.0),
+        ("A chair was removed from the room.",
+         "A chair was added to the room.", 0.0),
+        ("The square became larger.",
+         "The square rotated clockwise.", 0.0),
+        ("The lighting became darker.",
+         "A lamp was added to the scene.", 0.0),
+        ("The cat remained still on the mat.",
+         "The person moved from left to right.", 0.0),
+        ("The ball changed from red to blue.",
+         "The ball moved to the left.", 0.0),
+        ("The bicycle disappeared.",
+         "The bicycle moved forward.", 0.0),
+        ("The background became brighter.",
+         "The wheel rotated 90 degrees.", 0.0),
+        ("Nothing changed in the scene.",
+         "A dog appeared beside the chair.", 0.0),
+        ("The table moved closer to the camera.",
+         "The table became smaller.", 0.0),
+        ("The camera zoomed out.",
+         "The background changed color.", 0.0),
+        ("The vase rotated counterclockwise.",
+         "The vase was removed from the shelf.", 0.0),
+        ("A second person entered the scene.",
+         "The original person moved downward.", 0.0),
+        ("The box moved behind the chair.",
+         "The chair was removed from the scene.", 0.0),
     ]
-    templates_gt = [
-        "The person moved from left to right.",
-        "The person moved from left to right. The background also changed.",
-        "The object rotated 90 degrees clockwise.",
-        "The background changed significantly.",
-        "A completely different scene with no relation.",
-    ]
-    big_pairs = [
-        (random.choice(templates_pred), random.choice(templates_gt))
-        for _ in range(128)
-    ]
+
+    # 三档分别取 43/43/42 条并固定打乱，组成均衡、可复现的 128 条 batch。
+    templates_by_tier = {
+        tier: [case for case in labeled_templates if case[2] == tier]
+        for tier in (1.0, 0.5, 0.0)
+    }
+    big_labeled_cases = []
+    for tier, count in ((1.0, 43), (0.5, 43), (0.0, 42)):
+        tier_templates = templates_by_tier[tier]
+        big_labeled_cases.extend(
+            tier_templates[i % len(tier_templates)] for i in range(count)
+        )
+    random.Random(42).shuffle(big_labeled_cases)
+    big_pairs = [(pred, gt) for pred, gt, _ in big_labeled_cases]
+    gt_scores = [expected for _, _, expected in big_labeled_cases]
+
     t0 = time.time()
     big_scores = score_summaries(big_pairs)
     t1 = time.time()
+
+    tier_values = tuple(CHOICE_SCORES.values())
+    predicted_tiers = [
+        min(tier_values, key=lambda value: abs(score - value))
+        for score in big_scores
+    ]
+    tier_hits = [pred == gt for pred, gt in zip(predicted_tiers, gt_scores)]
+    absolute_errors = [
+        abs(score - gt) for score, gt in zip(big_scores, gt_scores)
+    ]
+
+    print("  idx | GT  | output | tier | hit | model summary -> reference summary")
+    for i, ((pred, gt, expected), score, tier, hit) in enumerate(
+        zip(big_labeled_cases, big_scores, predicted_tiers, tier_hits), start=1
+    ):
+        print(
+            f"  {i:03d} | {expected:.1f} | {score:.4f} | {tier:.1f}  | "
+            f"{'Y' if hit else 'N'}   | {pred} -> {gt}"
+        )
+
     print(f"  128 样本批量耗时: {t1-t0:.2f}s ({(t1-t0)/128:.3f}s/条)")
     print(f"  分数范围: [{min(big_scores):.4f}, {max(big_scores):.4f}]")
     print(f"  平均分数: {sum(big_scores)/len(big_scores):.4f}")
+    print(
+        f"  三档命中率: {sum(tier_hits)}/{len(tier_hits)} "
+        f"({sum(tier_hits)/len(tier_hits):.2%})"
+    )
+    print(f"  对 GT 的 MAE: {sum(absolute_errors)/len(absolute_errors):.4f}")
+    for gt_tier in (1.0, 0.5, 0.0):
+        indices = [i for i, gt in enumerate(gt_scores) if gt == gt_tier]
+        hits = sum(tier_hits[i] for i in indices)
+        mean_output = sum(big_scores[i] for i in indices) / len(indices)
+        print(
+            f"  GT={gt_tier:.1f}: {hits}/{len(indices)} 命中, "
+            f"平均输出={mean_output:.4f}"
+        )
 
     print("\n=== 测试完毕 ===")
