@@ -67,15 +67,15 @@ JSON RLVR Reward Function（分类奖励框架）
         c) 含 move 且有 >1 组括号数值向量
 
     通过门控后，对每个匈牙利匹配对 (gt_i, pred_j, iou_ij):
-      kw_score = 关键词子集召回（pred ⊆ GT → |pred∩GT|/|GT；
-                                  pred 多了 → 0；GT 必含关键词）
-      dir_coef = 方向系数（见下），默认 1.0
-      R3_pair = kw_score × iou_ij × dir_coef
-    R3 = mean(R3_pairs)。无匹配 → 0.0。
+      pred 多报任一关键词 → label_score = 0
+      普通关键词命中记 1；move 命中记方向系数 dir_coef（见下）
+      label_score = 各 GT 关键词子项得分之和 / |GT 关键词|
+      R3_pair = label_score × iou_ij
+    R3 = mean(R3_pairs)。格式门控优先于“无匹配”判定；通过门控后无匹配 → 0.0。
 
     方向系数 dir_coef（原 R4 融入，仅在 move 同时 ∈ gt_kw 且 ∈ pred_kw 时生效）:
       GT label 有箭头向量:
-        dir_coef = cosθ（同向=1, 垂直=0, 反向=-1）
+        dir_coef = cosθ（同向=1, 垂直=0, 反向=-1；零向量=0）
         GT 3 值 + pred 2 值 → dir_coef -= 0.2（丢失深度，无条件扣）
       GT label 有 move 但无箭头:
         dir_coef = 1.0（GT 没要求方向，pred 有 move 且格式合规即可）
@@ -546,15 +546,12 @@ def _score_r3(gt_entries, pred_entries, matches):
         c) 含 move 且有 >1 组括号数值向量
 
     通过门控后，对每个匹配对:
-      kw_score = 关键词子集召回（pred ⊆ GT → |pred∩GT|/|GT；
-                                  pred 多了 → 0）
-      dir_coef = 方向系数（原 R4 融入），默认 1.0
-      R3_pair = kw_score × iou_ij × dir_coef
-    R3 = mean(R3_pairs)。无匹配 → 0.0。
+      pred 多报任一关键词 → label_score = 0。
+      否则，普通关键词命中记 1，move 命中记方向系数（原 R4 融入），
+      再除以 GT 关键词数。因此 move 方向只影响 move 子项。
+      R3_pair = label_score × iou_ij。
+    R3 = mean(R3_pairs)。格式门控优先于无匹配判定；通过后无匹配 → 0.0。
     """
-    if not matches:
-        return 0.0
-
     # ── 格式硬门控: 遍历所有 pred entries（不只匹配上的） ──
     for _, pred_label in pred_entries:
         pl = pred_label.lower()
@@ -567,6 +564,9 @@ def _score_r3(gt_entries, pred_entries, matches):
         if has_move and vec_count > 1:
             return -1.0  # 多组向量
 
+    if not matches:
+        return 0.0
+
     # ── 逐匹配对计算 ──
     scores = []
     for gi, pi, iou in matches:
@@ -575,50 +575,71 @@ def _score_r3(gt_entries, pred_entries, matches):
         gt_set = _extract_keyword_set(gt_label)
         pred_set = _extract_keyword_set(pred_label)
 
-        # 关键词子集召回
-        if pred_set <= gt_set:
-            kw_score = len(pred_set & gt_set) / len(gt_set) if gt_set else 0.0
+        if not gt_set or not pred_set <= gt_set:
+            label_score = 0.0  # GT 无可评关键词，或 pred 多报
         else:
-            kw_score = 0.0  # 多报归零
+            label_points = float(len(pred_set))
 
-        # 方向系数 dir_coef（原 R4 融入）
-        dir_coef = 1.0
-        if "move" in gt_set and "move" in pred_set:
-            gt_vec, gt_ndim = _extract_direction_vec(gt_label, gt_entries[gi][0])
-            pred_vec, pred_ndim = _extract_direction_vec(pred_label, pred_entries[pi][0])
-            if gt_vec is not None and pred_vec is not None:
-                norm = np.linalg.norm(gt_vec) * np.linalg.norm(pred_vec)
-                if norm >= 1e-12:
-                    cos_theta = np.dot(gt_vec, pred_vec) / norm
-                    cos_theta = max(-1.0, min(1.0, float(cos_theta)))
-                    dir_coef = cos_theta
+            # move 命中时，用方向系数替换该 move 子项原本的 1 分。
+            if "move" in gt_set and "move" in pred_set:
+                dir_coef = 1.0
+                gt_vec, gt_ndim = _extract_direction_vec(
+                    gt_label, gt_entries[gi][0]
+                )
+                pred_vec, pred_ndim = _extract_direction_vec(
+                    pred_label, pred_entries[pi][0]
+                )
+                if gt_vec is not None:
+                    # GT 给了箭头时，零向量没有方向，不能保留默认满分。
+                    dir_coef = 0.0
+                    if pred_vec is not None:
+                        norm = np.linalg.norm(gt_vec) * np.linalg.norm(pred_vec)
+                        if np.isfinite(norm) and norm >= 1e-12:
+                            cos_theta = np.dot(gt_vec, pred_vec) / norm
+                            if np.isfinite(cos_theta):
+                                dir_coef = max(
+                                    -1.0, min(1.0, float(cos_theta))
+                                )
+                    # GT 三值、pred 二值时无条件扣 0.2，
+                    # 包括其中一个是零向量的情况。
                     if gt_ndim == 3 and pred_ndim == 2:
-                        dir_coef -= 0.2  # 丢失深度，无条件扣
-            # GT 有 move 但无箭头 → dir_coef 保持 1.0
-            # GT 有箭头但 pred 无箭头 → 不会到这里（格式门控已拦截）
+                        dir_coef -= 0.2
+                # GT 有 move 但无箭头 → dir_coef 保持 1.0。
+                # pred 有 move 但无合法箭头 → 已被格式门控拦截。
+                label_points += dir_coef - 1.0
 
-        scores.append(kw_score * iou * dir_coef)
+            label_score = label_points / len(gt_set)
+
+        scores.append(label_score * iou)
 
     return sum(scores) / len(scores)
+
+
+def _extract_bracket_vectors(label):
+    """提取 label 中格式严格的 2/3 值有限数值向量。
+
+    括号内所有分量都必须是数字；不忽略非数字内容。
+    """
+    vectors = []
+    for match in re.finditer(r"\(([^)]+)\)", label):
+        parts = re.split(r"[,\s]+", match.group(1).strip())
+        if len(parts) not in (2, 3):
+            continue
+        try:
+            nums = tuple(float(part) for part in parts)
+        except ValueError:
+            continue
+        if all(np.isfinite(value) for value in nums):
+            vectors.append(nums)
+    return vectors
 
 
 def _count_bracket_vectors(label):
     """统计 label 中括号内数值向量（2 值或 3 值）的组数。
 
-    用于 R4 格式门控: 预测 label 出现超过一组括号数值向量 → R4=-1。
+    用于 R3 格式门控。
     """
-    count = 0
-    for m in re.finditer(r"\(([^)]+)\)", label):
-        parts = re.split(r"[,\s]+", m.group(1).strip())
-        nums = []
-        for p in parts:
-            try:
-                nums.append(float(p))
-            except ValueError:
-                continue
-        if len(nums) in (2, 3):
-            count += 1
-    return count
+    return len(_extract_bracket_vectors(label))
 
 
 def _extract_direction_vec(label, bbox):
@@ -630,16 +651,10 @@ def _extract_direction_vec(label, bbox):
       三值 (x, y, z): 方向本身 → 取前两维 (x, y)
     返回 ((dx, dy), n_dims)，n_dims ∈ {2, 3}；无法提取返回 (None, 0)。
     """
-    m = re.search(r"\(([^)]+)\)", label)
-    if not m:
+    vectors = _extract_bracket_vectors(label)
+    if not vectors:
         return None, 0
-    parts = re.split(r"[,\s]+", m.group(1).strip())
-    nums = []
-    for p in parts:
-        try:
-            nums.append(float(p))
-        except ValueError:
-            continue
+    nums = vectors[0]
     if len(nums) == 2:
         x, y = nums
         cx = (bbox[0] + bbox[2]) / 2.0
