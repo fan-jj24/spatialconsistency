@@ -969,6 +969,10 @@ if __name__ == "__main__":
     ]
 
     reward_model = get_reward_model()
+    # _build_prompt 依赖已初始化的 tokenizer。生产评分路径会在构建
+    # prompt 前调用 _ensure_loaded()；本地诊断直接构建 prompt，因此
+    # 需要先显式加载，避免 tokenizer 仍为 None。
+    reward_model.load()
     path_prompt = reward_model._build_prompt(
         "The woman is left of the man.",
         "The man is right of the woman.",
