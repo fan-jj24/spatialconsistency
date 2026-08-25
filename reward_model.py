@@ -774,7 +774,14 @@ def score_summaries(pairs: List[Tuple[str, str]]) -> List[float]:
 
 # ── 本地真实模型诊断 ──
 if __name__ == "__main__":
+    from collections import Counter
     import time
+
+    from reward_model_diagnostic_cases import (
+        DIAGNOSTIC_BATCH_SIZE,
+        EXPECTED_CLASSES,
+        build_realistic_diagnostic_cases,
+    )
 
     logging.basicConfig(level=logging.INFO)
     print("=== R4 summary 单次四分类打分诊断 ===")
@@ -871,4 +878,128 @@ if __name__ == "__main__":
     print(
         f"共 {len(diagnostic_pairs)} 对，耗时 {elapsed:.2f}s "
         f"({elapsed / len(diagnostic_pairs):.2f}s/对)"
+    )
+
+    print("\n=== 128 条真实训练风格四分类测试（32 条/batch）===")
+    realistic_cases = build_realistic_diagnostic_cases()
+    all_case_results = []
+    total_started_at = time.perf_counter()
+    for batch_start in range(0, len(realistic_cases), DIAGNOSTIC_BATCH_SIZE):
+        batch_number = batch_start // DIAGNOSTIC_BATCH_SIZE + 1
+        batch_cases = realistic_cases[
+            batch_start : batch_start + DIAGNOSTIC_BATCH_SIZE
+        ]
+        if len(batch_cases) != DIAGNOSTIC_BATCH_SIZE:
+            raise RuntimeError(
+                f"Diagnostic batch {batch_number} has {len(batch_cases)} cases, "
+                f"expected {DIAGNOSTIC_BATCH_SIZE}"
+            )
+
+        batch_started_at = time.perf_counter()
+        batch_results = reward_model.score_summaries_detailed(
+            [
+                (case.pred_summary, case.gt_summary)
+                for case in batch_cases
+            ]
+        )
+        batch_elapsed = time.perf_counter() - batch_started_at
+        all_case_results.extend(zip(batch_cases, batch_results))
+
+        batch_predictions = [
+            CHOICE_LETTERS[
+                max(
+                    range(len(CHOICE_LETTERS)),
+                    key=lambda i: result.probabilities[i],
+                )
+            ]
+            for result in batch_results
+        ]
+        batch_hits = sum(
+            predicted == case.expected_class
+            for case, predicted in zip(batch_cases, batch_predictions)
+        )
+        expected_counts = Counter(case.expected_class for case in batch_cases)
+        print(
+            f"  batch {batch_number}/4: {len(batch_cases)} 条，"
+            f"A/B/C/D={expected_counts['A']}/{expected_counts['B']}/"
+            f"{expected_counts['C']}/{expected_counts['D']}，"
+            f"top-1={batch_hits}/{len(batch_cases)}，耗时 {batch_elapsed:.2f}s"
+        )
+
+    total_elapsed = time.perf_counter() - total_started_at
+    if len(all_case_results) != len(realistic_cases):
+        raise RuntimeError(
+            "R4 diagnostic returned the wrong result count: "
+            f"{len(all_case_results)} != {len(realistic_cases)}"
+        )
+
+    confusion = {
+        expected: Counter()
+        for expected in EXPECTED_CLASSES
+    }
+    class_scores = {
+        expected: []
+        for expected in EXPECTED_CLASSES
+    }
+    mismatches = []
+    absolute_errors = []
+    for case_index, (case, result) in enumerate(all_case_results, start=1):
+        predicted_index = max(
+            range(len(CHOICE_LETTERS)),
+            key=lambda i: result.probabilities[i],
+        )
+        predicted_class = CHOICE_LETTERS[predicted_index]
+        confusion[case.expected_class][predicted_class] += 1
+        class_scores[case.expected_class].append(result.score)
+        expected_score = CHOICE_WEIGHTS[
+            CHOICE_LETTERS.index(case.expected_class)
+        ]
+        absolute_errors.append(abs(result.score - expected_score))
+        if predicted_class != case.expected_class:
+            mismatches.append(
+                (case_index, case, result, predicted_class)
+            )
+
+    hits = len(realistic_cases) - len(mismatches)
+    print("\n  混淆矩阵（行=预期，列=预测）:")
+    print("          A   B   C   D")
+    for expected_class in EXPECTED_CLASSES:
+        row = confusion[expected_class]
+        print(
+            f"    {expected_class}: "
+            f"{row['A']:3d} {row['B']:3d} {row['C']:3d} {row['D']:3d}"
+        )
+
+    print("\n  各类别连续分数:")
+    for expected_class in EXPECTED_CLASSES:
+        scores = class_scores[expected_class]
+        print(
+            f"    {expected_class}: mean={sum(scores) / len(scores):.4f}, "
+            f"min={min(scores):.4f}, max={max(scores):.4f}"
+        )
+
+    if mismatches:
+        print(f"\n  误判明细（{len(mismatches)} 条）:")
+        for case_index, case, result, predicted_class in mismatches:
+            probabilities = "/".join(
+                f"{value:.3f}" for value in result.probabilities
+            )
+            print(
+                f"    #{case_index:03d} {case.description}: "
+                f"expected={case.expected_class}, top={predicted_class}, "
+                f"score={result.score:.4f}, A/B/C/D={probabilities}, "
+                f"mass={result.choice_mass:.3f}"
+            )
+            print(f"      candidate: {case.pred_summary}")
+            print(f"      reference: {case.gt_summary}")
+    else:
+        print("\n  误判明细：无")
+
+    print(
+        f"\n  总计: {len(realistic_cases)} 条 / "
+        f"{len(realistic_cases) // DIAGNOSTIC_BATCH_SIZE} batches，"
+        f"top-1={hits}/{len(realistic_cases)} ({hits / len(realistic_cases):.2%})，"
+        f"耗时 {total_elapsed:.2f}s "
+        f"({total_elapsed / len(realistic_cases):.3f}s/条)，"
+        f"对类别目标分数 MAE={sum(absolute_errors) / len(absolute_errors):.4f}"
     )
