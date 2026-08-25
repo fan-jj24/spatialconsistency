@@ -94,8 +94,9 @@ JSON RLVR Reward Function（分类奖励框架）
     同目录 reward_model_client.py 发起单条 HTTP 请求，由服务动态攒批。
 
     调用: reward_model_client.score_summary(pred_summary, gt_summary)
-    返回: 四分类概率加权分数，范围 [0, 1]。A=完全匹配，B=仅漏报，
-    C=有正确重合但存在错报或矛盾，D=无实质匹配；对应权重为
+    返回: 三个二分类概率组合分数，范围 [0, 1]。模型分别判断候选是否
+    含错报、是否覆盖全部真值、是否至少命中一个事实，再组合为完全匹配、
+    仅漏报、有重合但含错报、无实质匹配四种概率；对应权重为
     1、0.5、0.25、0，由中央服务中的 0.8B 模型批量判断。
     性能: CPU bfloat16，由中央服务动态合批
 
@@ -712,7 +713,7 @@ def _score_r4(pred_obj, gt_obj):
     样本，R4 记 0；客户端、网络、模型加载和推理异常则直接向上抛出。
 
     Returns:
-        float ∈ [0, 1]: 四分类概率加权分数。
+        float ∈ [0, 1]: 三个二分类概率组合后的分数。
     """
     if not isinstance(pred_obj, dict) or not isinstance(gt_obj, dict):
         return 0.0
