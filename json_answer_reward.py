@@ -94,7 +94,8 @@ JSON RLVR Reward Function（分类奖励框架）
     同目录 reward_model_client.py 发起单条 HTTP 请求，由服务动态攒批。
 
     调用: reward_model_client.score_summary(pred_summary, gt_summary)
-    返回: 1.0×P(A) + 0.5×P(B) + 0.0×P(C)，范围 [0, 1]
+    返回: support × coverage，范围 [0, 1]。其中 support 处罚错报，
+    coverage 处罚漏报；两者都由中央服务中的 0.8B 模型批量判断。
     性能: CPU bfloat16, 单样本 ~3s, batch 更快
 
     输入: pred summary（从模型输出 JSON 的 summary 键提取）
@@ -710,7 +711,7 @@ def _score_r4(pred_obj, gt_obj):
     样本，R4 记 0；客户端、网络、模型加载和推理异常则直接向上抛出。
 
     Returns:
-        float ∈ [0, 1]: 1.0×P(A) + 0.5×P(B) + 0.0×P(C)。
+        float ∈ [0, 1]: support × coverage。
     """
     if not isinstance(pred_obj, dict) or not isinstance(gt_obj, dict):
         return 0.0
