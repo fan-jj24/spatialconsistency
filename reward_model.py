@@ -9,7 +9,7 @@
   - 模型单例: 由 reward_model_server.py 常驻进程加载一份并复用。
   - 下载: ModelScope snapshot_download（sandbox 内 HF 不可达）。
   - CPU 推理: dtype=bfloat16, device_map="cpu"。
-  - 批处理: 支持单条和批量调用，批量时统一 right-padding。
+  - 批处理: 支持单条和批量调用，批量时统一 left-padding。
   - 异常处理: 模型加载或推理失败时直接抛出异常，中断训练。
   - 线程安全: 加载和推理各用一把锁，避免 verl 多线程 reward 并发问题。
 
@@ -28,20 +28,25 @@
     3. Any match: 候选是否至少正确覆盖一个完整事实。
 
   每个问题固定 ``A=YES``、``B=NO``。一批 N 对 summary 构造 3N 个
-  prompt，但合并在一次 backbone forward 中完成，不 generate。组合为：
-    P(complete) = P(no_error) * P(full_coverage)
-    P(omission) = P(no_error) * P(not_full_coverage)
+  prompt，但合并在一次 CausalLM forward 中完成，不 generate。组合为：
+    P(complete) = P(any_match) * P(no_error) * P(full_coverage)
+    P(omission) = P(any_match) * P(no_error) * P(not_full_coverage)
     P(mixed) = P(has_error) * P(any_match)
-    P(no_match) = P(has_error) * P(no_any_match)
+    P(no_match) = P(no_any_match)
     R4 = P(complete) + 0.50 * P(omission) + 0.25 * P(mixed)
 
   每个二分类问题都提供针对性的短示例。聊天模板显式使用
   ``enable_thinking=False``，确保 assistant 的第一个输出 token 就是
   分类答案，而不是思考内容。
 
-  模型每次只需从 A/B 两个选项中选一个。只在每个 prompt 的最后一个
-  hidden state 上计算完整词表 logits，用于确认 A/B 的绝对概率质量；不会构造
-  ``batch × sequence × vocabulary`` 的大张量。若两个选项的总概率过低，
+  few-shot 使用真实的 user/assistant 对话轮次，不把示例伪装成一段
+  user 文本。模型每次只需从 A/B 两个选项中选一个。
+
+  生产推理调用完整 CausalLM ``forward`` 并用 ``logits_to_keep=1``，
+  不再绕过官方模型包装。只在最后一个 hidden state 上计算词表
+  logits，不会构造 ``batch × sequence × vocabulary`` 的大张量。
+  A/B 两行输出层单独使用 FP32，避免 BF16 先量化 logit 差再转 FP32。
+  完整词表 logits 仅用于确认 A/B 的绝对概率质量。若两个选项的总概率过低，
   说明模型没有在做要求的分类，直接报错中断训练。
 
   forward 比 generate 更好: 确定性，无采样噪声，不会两次结果不一致，
@@ -54,8 +59,8 @@
   token id 获取: 只接受严格的大写 ``A``/``B`` 单 token，不再将
   小写或带空格的 token 与大写答案合并取最大 logit。
 
-  三个问题没有“部分正确”中间选项，降低 0.8B 模型长期选择中间档的
-  倾向；四种奖励语义由三个 Yes/No 概率在代码中组合得到。
+  三个问题没有“部分正确”中间选项。组合时 AnyMatch 是事实命中
+  门控：无事实命中时全部归入 no_match，不会因 HasError 误判被奖励为“仅遗漏”。
 
   prompt 用英文（与 summary 语言一致），避免跨语言理解力下降。
 
@@ -113,7 +118,6 @@ SYSTEM_PROMPT = (
     "conflict. 'Consistent', 'different', and 'uncertain' are distinct conclusions."
 )
 COMMON_INPUT_TEMPLATE = (
-    "Now judge the actual summaries:\n"
     "REFERENCE:\n<reference>\n{gt}\n</reference>\n\n"
     "CANDIDATE:\n<candidate>\n{pred}\n</candidate>\n\n"
     "Return exactly A or B."
@@ -123,45 +127,65 @@ QUESTION_TEMPLATES = {
         "Task: Does the candidate contain ANY material fact that is unsupported "
         "by or contradicts the reference? An omitted reference fact is NOT an error.\n"
         "A - YES, there is at least one error.\n"
-        "B - NO, every candidate fact is supported.\n"
-        "Examples:\n"
-        "Reference: The woman moved left. Candidate: The woman moved right. Answer: A\n"
-        "Reference: The woman moved left. The chair disappeared. Candidate: The woman "
-        "moved left. Answer: B\n"
-        "Reference: The man is right of the woman. Candidate: The woman is left of the "
-        "man. Answer: B\n"
-        "Reference: The woman moved left. Candidate: The woman moved left. A chair "
-        "appeared. Answer: A"
+        "B - NO, every candidate fact is supported."
     ),
     "full_coverage": (
         "Task: Does the candidate correctly convey EVERY material fact in the "
         "reference? Extra candidate errors do not erase a correctly covered reference "
         "fact; judge coverage only.\n"
         "A - YES, every reference fact is correctly covered.\n"
-        "B - NO, at least one reference fact is missing or incorrectly expressed.\n"
-        "Examples:\n"
-        "Reference: The woman moved left. The chair disappeared. Candidate: The woman "
-        "moved left. Answer: B\n"
-        "Reference: The man is right of the woman. Candidate: The woman is left of the "
-        "man. Answer: A\n"
-        "Reference: The woman moved left. Candidate: The woman moved left. The chair "
-        "disappeared. Answer: A\n"
-        "Reference: The woman moved left. Candidate: The woman moved right. Answer: B"
+        "B - NO, at least one reference fact is missing or incorrectly expressed."
     ),
     "any_match": (
         "Task: Does the candidate correctly convey AT LEAST ONE complete material "
         "fact from the reference? Shared words or an action with the wrong entity, "
         "direction, polarity, or added/missing status do NOT count.\n"
         "A - YES, at least one complete fact matches.\n"
-        "B - NO, no complete material fact matches.\n"
-        "Examples:\n"
-        "Reference: The woman moved left. The chair disappeared. Candidate: The woman "
-        "moved left. Answer: A\n"
-        "Reference: The woman moved left. Candidate: The woman moved right. Answer: B\n"
-        "Reference: The red-shirted woman moved left. Candidate: The blue-shirted man "
-        "moved left. Answer: B\n"
-        "Reference: The man is right of the woman. Candidate: The woman is left of the "
-        "man. Answer: A"
+        "B - NO, no complete material fact matches."
+    ),
+}
+QUESTION_EXAMPLES = {
+    "has_error": (
+        ("The woman moved left.", "The woman moved right.", "A"),
+        (
+            "The woman moved left. The chair disappeared.",
+            "The woman moved left.",
+            "B",
+        ),
+        ("The man is right of the woman.", "The woman is left of the man.", "B"),
+        (
+            "The woman moved left.",
+            "The woman moved left. A chair appeared.",
+            "A",
+        ),
+    ),
+    "full_coverage": (
+        (
+            "The woman moved left. The chair disappeared.",
+            "The woman moved left.",
+            "B",
+        ),
+        ("The man is right of the woman.", "The woman is left of the man.", "A"),
+        (
+            "The woman moved left.",
+            "The woman moved left. The chair disappeared.",
+            "A",
+        ),
+        ("The woman moved left.", "The woman moved right.", "B"),
+    ),
+    "any_match": (
+        (
+            "The woman moved left. The chair disappeared.",
+            "The woman moved left.",
+            "A",
+        ),
+        ("The woman moved left.", "The woman moved right.", "B"),
+        (
+            "The red-shirted woman moved left.",
+            "The blue-shirted man moved left.",
+            "B",
+        ),
+        ("The man is right of the woman.", "The woman is left of the man.", "A"),
     ),
 }
 JUDGMENT_TYPES = ("has_error", "full_coverage", "any_match")
@@ -207,9 +231,12 @@ class RewardModel:
         self._loaded = False
         self._choice_token_ids = None  # {"A": [id], "B": [id]}
         self._backbone = None
+        self._lm_head = None
         self._lm_head_weight = None
         self._lm_head_bias = None
         self._choice_token_index = None
+        self._choice_head_weight = None
+        self._choice_head_bias = None
 
     def _ensure_loaded(self):
         """延迟加载模型（线程安全，只加载一次）。
@@ -266,12 +293,13 @@ class RewardModel:
                 self._tokenizer = AutoTokenizer.from_pretrained(
                     model_path, **tok_kwargs,
                 )
-                # right-padding: padding 在序列末尾，不污染 DeltaNet
-                # 的递归状态（left-padding 会把 padding token 放在前面，
-                # 线性注意力的递归状态从头被污染，导致 logits 偏移）
+                # decoder-only 批推理使用 left-padding，使所有样本的
+                # assistant generation marker 都在最后一个位置。这样可以
+                # 安全使用官方 forward(logits_to_keep=1)。Qwen3.5 会用
+                # attention_mask 将 DeltaNet 的 padding hidden states 置零。
                 if self._tokenizer.pad_token is None:
                     self._tokenizer.pad_token = self._tokenizer.eos_token
-                self._tokenizer.padding_side = "right"
+                self._tokenizer.padding_side = "left"
 
                 self._model = AutoModelForCausalLM.from_pretrained(
                     model_path, **model_kwargs,
@@ -333,10 +361,11 @@ class RewardModel:
         return result
 
     def _prepare_choice_head(self):
-        """准备输出层及 A/B token 索引。
+        """准备官方输出层及 A/B 的 FP32 子头。
 
-        后续只对每个 prompt 的最后一个 hidden state 计算词表 logits，
-        以便同时得到二分类内部概率和 A/B 的绝对概率质量。
+        完整词表仍保持模型原生 dtype，只用于计算选项总质量。
+        A/B logits 使用 FP32 hidden state 与 FP32 权重重算，避免
+        BF16 输出层将两个相近 logit 的差值量化。
         """
         self._backbone = self._model.base_model
         if self._backbone is self._model:
@@ -346,6 +375,7 @@ class RewardModel:
         if lm_head is None or not hasattr(lm_head, "weight"):
             raise RuntimeError("Cannot locate lm_head weights")
 
+        self._lm_head = lm_head
         self._lm_head_weight = lm_head.weight.detach()
         self._lm_head_bias = getattr(lm_head, "bias", None)
         if self._lm_head_bias is not None:
@@ -354,17 +384,40 @@ class RewardModel:
             [self._choice_token_ids[letter][0] for letter in CHOICE_LETTERS],
             device=lm_head.weight.device,
         )
+        self._choice_head_weight = self._lm_head_weight.index_select(
+            0, self._choice_token_index
+        ).to(torch.float32)
+        if self._lm_head_bias is not None:
+            self._choice_head_bias = self._lm_head_bias.index_select(
+                0, self._choice_token_index
+            ).to(torch.float32)
 
     def _hidden_to_choice_logits(
-        self, last_hidden: torch.Tensor
+        self,
+        last_hidden: torch.Tensor,
+        full_logits: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """返回 A/B logits 以及它们在整个词表中的总概率。"""
-        full_logits = F.linear(
-            last_hidden,
-            self._lm_head_weight,
-            self._lm_head_bias,
-        ).to(torch.float32)
-        choice_logits = full_logits.index_select(1, self._choice_token_index)
+        """返回 FP32 A/B logits 以及它们在整个词表中的总概率。"""
+        choice_logits = F.linear(
+            last_hidden.to(torch.float32),
+            self._choice_head_weight,
+            self._choice_head_bias,
+        )
+        if full_logits is None:
+            full_logits = F.linear(
+                last_hidden,
+                self._lm_head_weight,
+                self._lm_head_bias,
+            )
+        if full_logits.ndim != 2 or full_logits.shape[0] != last_hidden.shape[0]:
+            raise RuntimeError(
+                "R4 full logits have invalid shape: "
+                f"{tuple(full_logits.shape)!r}"
+            )
+        # 用 FP32 A/B 值替换词表中的 BF16 A/B 值，使分子与
+        # 分母严格来自同一组 logits。
+        full_logits = full_logits.to(torch.float32).clone()
+        full_logits.index_copy_(1, self._choice_token_index, choice_logits)
         log_choice_mass = (
             torch.logsumexp(choice_logits, dim=1)
             - torch.logsumexp(full_logits, dim=1)
@@ -395,15 +448,37 @@ class RewardModel:
         """构建一个固定 A=Yes / B=No 的二分类 prompt。"""
         if judgment_type not in QUESTION_TEMPLATES:
             raise ValueError(f"Unknown R4 judgment type: {judgment_type!r}")
-        user_text = (
-            QUESTION_TEMPLATES[judgment_type]
-            + "\n\n"
-            + COMMON_INPUT_TEMPLATE.format(gt=gt_summary, pred=pred_summary)
+        question = QUESTION_TEMPLATES[judgment_type]
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        for example_index, (example_gt, example_pred, answer) in enumerate(
+            QUESTION_EXAMPLES[judgment_type]
+        ):
+            example_case = COMMON_INPUT_TEMPLATE.format(
+                gt=example_gt,
+                pred=example_pred,
+            )
+            if example_index == 0:
+                example_case = question + "\n\nExamples:\n\n" + example_case
+            messages.extend(
+                (
+                    {"role": "user", "content": example_case},
+                    {"role": "assistant", "content": answer},
+                )
+            )
+        actual_case = COMMON_INPUT_TEMPLATE.format(
+            gt=gt_summary,
+            pred=pred_summary,
         )
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_text},
-        ]
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    question
+                    + "\n\nNow judge the actual summaries:\n\n"
+                    + actual_case
+                ),
+            }
+        )
         text = self._tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -453,7 +528,7 @@ class RewardModel:
     def _infer_choice_probabilities(
         self, prompts: List[str]
     ) -> Tuple[List[List[float]], List[float]]:
-        """在一次 batch forward 中推理多个 A=Yes/B=No 判断。"""
+        """用完整 CausalLM batch forward 推理 A=Yes/B=No 判断。"""
         encoded = self._tokenizer(
             prompts,
             return_tensors="pt",
@@ -470,21 +545,46 @@ class RewardModel:
 
         with self._infer_lock:
             with torch.no_grad():
-                outputs = self._backbone(
-                    **encoded,
-                    use_cache=False,
-                    return_dict=True,
+                captured_lm_head_inputs = []
+
+                def capture_lm_head_input(_module, inputs):
+                    if not inputs or not isinstance(inputs[0], torch.Tensor):
+                        raise RuntimeError("R4 could not capture the lm_head input")
+                    captured_lm_head_inputs.append(inputs[0])
+
+                hook = self._lm_head.register_forward_pre_hook(
+                    capture_lm_head_input
                 )
-                hidden_states = outputs.last_hidden_state
-                # right-padding: 最后一个有效 token 由 attention_mask 定位。
-                attention_mask = encoded["attention_mask"]
-                seq_lengths = attention_mask.sum(dim=1) - 1
-                batch_indices = torch.arange(
-                    hidden_states.size(0), device=hidden_states.device
-                )
-                last_hidden = hidden_states[batch_indices, seq_lengths, :]
+                try:
+                    outputs = self._model(
+                        **encoded,
+                        use_cache=False,
+                        return_dict=True,
+                        logits_to_keep=1,
+                    )
+                finally:
+                    hook.remove()
+
+                if len(captured_lm_head_inputs) != 1:
+                    raise RuntimeError(
+                        "R4 expected one lm_head call, got "
+                        f"{len(captured_lm_head_inputs)}"
+                    )
+                lm_head_input = captured_lm_head_inputs[0]
+                if lm_head_input.ndim != 3 or lm_head_input.shape[1] != 1:
+                    raise RuntimeError(
+                        "R4 expected one retained hidden state per prompt, got "
+                        f"{tuple(lm_head_input.shape)!r}"
+                    )
+                if outputs.logits.ndim != 3 or outputs.logits.shape[1] != 1:
+                    raise RuntimeError(
+                        "R4 official forward did not honor logits_to_keep=1: "
+                        f"{tuple(outputs.logits.shape)!r}"
+                    )
+                last_hidden = lm_head_input[:, -1, :]
                 choice_logits, choice_mass = self._hidden_to_choice_logits(
-                    last_hidden
+                    last_hidden,
+                    outputs.logits[:, -1, :],
                 )
 
         choice_masses = [float(value) for value in choice_mass.cpu().tolist()]
@@ -503,6 +603,142 @@ class RewardModel:
                 )
         return self._choice_logits_to_probabilities(choice_logits), choice_masses
 
+    def diagnose_inference_paths(
+        self,
+        prompt: str,
+        companion_prompt: Optional[str] = None,
+    ) -> dict:
+        """对照 generate、官方 forward、手工 backbone 和 padding batch。
+
+        该方法仅供本地诊断，不被生产评分调用。返回的
+        ``official_forward_bf16`` 使用模型原生输出层；其他
+        概率路径使用生产所需的 FP32 A/B 子头。
+        """
+        if not isinstance(prompt, str) or not prompt:
+            raise ValueError("R4 diagnostic prompt must be a non-empty string")
+        self._ensure_loaded()
+        if companion_prompt is None:
+            # 只用于让第一个 prompt 在 batch 中实际发生 left-padding。
+            # 第二个样本的语义和输出不进入诊断结果。
+            companion_prompt = ("Padding-equivalence companion.\n" * 32) + prompt
+
+        production_probabilities, production_masses = (
+            self._infer_choice_probabilities([prompt])
+        )
+        padded_probabilities, padded_masses = self._infer_choice_probabilities(
+            [prompt, companion_prompt]
+        )
+
+        encoded = self._tokenizer(
+            prompt,
+            return_tensors="pt",
+            padding=False,
+            truncation=False,
+        )
+        if encoded["input_ids"].shape[1] > MAX_INPUT_TOKENS:
+            raise RuntimeError("R4 diagnostic prompt exceeds MAX_INPUT_TOKENS")
+
+        with self._infer_lock:
+            with torch.no_grad():
+                official_outputs = self._model(
+                    **encoded,
+                    use_cache=False,
+                    return_dict=True,
+                    logits_to_keep=1,
+                )
+                official_full_logits = official_outputs.logits[:, -1, :]
+                official_choice_logits = official_full_logits.index_select(
+                    1, self._choice_token_index
+                )
+                official_choice_mass = (
+                    torch.logsumexp(
+                        official_choice_logits.to(torch.float32), dim=1
+                    )
+                    - torch.logsumexp(
+                        official_full_logits.to(torch.float32), dim=1
+                    )
+                ).exp()
+
+                manual_outputs = self._backbone(
+                    **encoded,
+                    use_cache=False,
+                    return_dict=True,
+                )
+                manual_choice_logits, manual_choice_mass = (
+                    self._hidden_to_choice_logits(
+                        manual_outputs.last_hidden_state[:, -1, :]
+                    )
+                )
+
+                generated = self._model.generate(
+                    **encoded,
+                    max_new_tokens=1,
+                    do_sample=False,
+                    use_cache=False,
+                    pad_token_id=self._tokenizer.pad_token_id,
+                )
+
+        official_probabilities = self._choice_logits_to_probabilities(
+            official_choice_logits
+        )[0]
+        manual_probabilities = self._choice_logits_to_probabilities(
+            manual_choice_logits
+        )[0]
+        generated_token_id = int(generated[0, -1].item())
+        official_top_token_id = int(
+            official_full_logits[0].argmax().item()
+        )
+
+        def path_result(probabilities, choice_mass):
+            return {
+                "probabilities": tuple(float(value) for value in probabilities),
+                "choice_mass": float(choice_mass),
+            }
+
+        return {
+            "generate": {
+                "token_id": generated_token_id,
+                "token": self._tokenizer.decode(
+                    [generated_token_id],
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                ),
+            },
+            "official_forward_bf16": {
+                **path_result(
+                    official_probabilities,
+                    official_choice_mass[0].item(),
+                ),
+                "top_token_id": official_top_token_id,
+                "top_token": self._tokenizer.decode(
+                    [official_top_token_id],
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                ),
+            },
+            "production_single_fp32": path_result(
+                production_probabilities[0], production_masses[0]
+            ),
+            "manual_backbone_fp32": path_result(
+                manual_probabilities, manual_choice_mass[0].item()
+            ),
+            "production_padded_batch_fp32": path_result(
+                padded_probabilities[0], padded_masses[0]
+            ),
+            "max_single_vs_manual_delta": max(
+                abs(left - right)
+                for left, right in zip(
+                    production_probabilities[0], manual_probabilities
+                )
+            ),
+            "max_single_vs_padded_delta": max(
+                abs(left - right)
+                for left, right in zip(
+                    production_probabilities[0], padded_probabilities[0]
+                )
+            ),
+        }
+
     def score_summary(self, pred_summary: str, gt_summary: str) -> float:
         """以三个二分类校验单条 summary 语义一致性。
 
@@ -519,7 +755,7 @@ class RewardModel:
     ) -> List[float]:
         """在一次 3N prompt forward 中批量计算组合奖励。
 
-        使用 right-padding。空文本为 0，规范化后完全相同的文本为 1，
+        使用 left-padding。空文本为 0，规范化后完全相同的文本为 1，
         二者均不进入模型 batch。
 
         Args:
@@ -619,10 +855,22 @@ class RewardModel:
                 )
 
             has_error, full_coverage, any_match = binary_results
-            complete = has_error.no_probability * full_coverage.yes_probability
-            omission = has_error.no_probability * full_coverage.no_probability
-            mixed = has_error.yes_probability * any_match.yes_probability
-            no_fact_match = has_error.yes_probability * any_match.no_probability
+            # AnyMatch 是互斥类别的顶层门控。若没有任何完整
+            # 事实命中，就应全部归入 no_fact_match；否则再根据
+            # HasError 和 FullCoverage 区分 complete/omission/mixed。
+            fact_match = any_match.yes_probability
+            complete = (
+                fact_match
+                * has_error.no_probability
+                * full_coverage.yes_probability
+            )
+            omission = (
+                fact_match
+                * has_error.no_probability
+                * full_coverage.no_probability
+            )
+            mixed = fact_match * has_error.yes_probability
+            no_fact_match = any_match.no_probability
             class_probabilities = (complete, omission, mixed, no_fact_match)
             probability_sum = sum(class_probabilities)
             if not math.isclose(probability_sum, 1.0, rel_tol=1e-5, abs_tol=1e-5):
@@ -720,8 +968,43 @@ if __name__ == "__main__":
         ),
     ]
 
+    reward_model = get_reward_model()
+    path_prompt = reward_model._build_prompt(
+        "The woman is left of the man.",
+        "The man is right of the woman.",
+        "has_error",
+    ).text
+    print("\n--- 推理路径对照：等价逆关系 HasError（预期 B=NO） ---")
+    path_diagnostic = reward_model.diagnose_inference_paths(path_prompt)
+    generate_result = path_diagnostic["generate"]
+    print(
+        "  official generate: "
+        f"token={generate_result['token']!r} id={generate_result['token_id']}"
+    )
+    for path_name, display_name in (
+        ("official_forward_bf16", "official forward BF16"),
+        ("production_single_fp32", "production single FP32"),
+        ("manual_backbone_fp32", "manual backbone FP32"),
+        ("production_padded_batch_fp32", "production padded batch FP32"),
+    ):
+        path_result = path_diagnostic[path_name]
+        yes_probability, no_probability = path_result["probabilities"]
+        extra = ""
+        if path_name == "official_forward_bf16":
+            extra = f" top={path_result['top_token']!r}"
+        print(
+            f"  {display_name}: A/B={yes_probability:.6f}/"
+            f"{no_probability:.6f} mass={path_result['choice_mass']:.6f}"
+            f"{extra}"
+        )
+    print(
+        "  max probability delta: "
+        f"single/manual={path_diagnostic['max_single_vs_manual_delta']:.6g}, "
+        f"single/padded={path_diagnostic['max_single_vs_padded_delta']:.6g}"
+    )
+
     started_at = time.time()
-    diagnostic_results = get_reward_model().score_summaries_detailed(
+    diagnostic_results = reward_model.score_summaries_detailed(
         [(pred, gt) for pred, gt, _ in diagnostic_pairs]
     )
     elapsed = time.time() - started_at
