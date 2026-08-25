@@ -49,10 +49,12 @@ R4_SERVER_STARTUP_TIMEOUT=${R4_SERVER_STARTUP_TIMEOUT:-600}
 R4_SERVER_LOG=${R4_SERVER_LOG:-"/tmp/spatialconsistency_r4_reward_server.log"}
 export R4_REWARD_URL=${R4_REWARD_URL:-"http://${R4_SERVER_HOST}:${R4_SERVER_PORT}"}
 export R4_REWARD_TIMEOUT_SECONDS=${R4_REWARD_TIMEOUT_SECONDS:-300}
-# 奖励模型与 VERL 共用 8 张卡。奖励 vLLM 的显存 profiling、
-# KV cache 大小和 CUDA Graph 执行路径均使用 vLLM 默认值。
+# 奖励模型与 VERL 共用 8 张卡。1 GiB/卡的显式 KV cache 避免 vLLM
+# 按比例预留大量无用 cache；eager 只关闭 CUDA Graph，不影响 Attention backend。
 R4_CUDA_VISIBLE_DEVICES=${R4_CUDA_VISIBLE_DEVICES:-"0,1,2,3,4,5,6,7"}
 export R4_VLLM_TENSOR_PARALLEL_SIZE=${R4_VLLM_TENSOR_PARALLEL_SIZE:-8}
+export R4_VLLM_KV_CACHE_BYTES=${R4_VLLM_KV_CACHE_BYTES:-1073741824}
+export R4_VLLM_GPU_MEMORY_UTILIZATION=${R4_VLLM_GPU_MEMORY_UTILIZATION:-0.08}
 export R4_VLLM_MAX_NUM_SEQS=${R4_VLLM_MAX_NUM_SEQS:-${R4_SERVER_MAX_BATCH_SIZE}}
 export R4_VLLM_LOGPROBS=${R4_VLLM_LOGPROBS:-128}
 R4_VLLM_WORKER_MULTIPROC_METHOD=${R4_VLLM_WORKER_MULTIPROC_METHOD:-spawn}
@@ -194,7 +196,7 @@ echo "  数据根目录:     ${DATA_ROOT}"
 echo "  Reward:         ${REWARD_FILE}"
 echo "  R4 service:     ${R4_REWARD_URL} (batch=${R4_SERVER_MAX_BATCH_SIZE}, wait=${R4_SERVER_MAX_WAIT_MS}ms)"
 echo "  R4 model:       ${R4_MODEL_LOCAL_PATH} (Qwen3.5-9B, vLLM BF16 TP=${R4_VLLM_TENSOR_PARALLEL_SIZE})"
-echo "  R4 GPUs:        ${R4_CUDA_VISIBLE_DEVICES} (vLLM default memory/CUDA Graph settings)"
+echo "  R4 GPUs:        ${R4_CUDA_VISIBLE_DEVICES} (eager, KV cache=${R4_VLLM_KV_CACHE_BYTES} bytes/GPU)"
 echo "  Epochs:         ${TOTAL_EPOCHS} (ppo_epochs=1, 样本不重复迭代)"
 echo "  LR:             ${ACTOR_LR} (warmup steps=${ACTOR_LR_WARMUP_STEPS})"
 echo "  Batch:          train=${TRAIN_BATCH_SIZE}, mini=${PPO_MINI_BATCH_SIZE}, rollout_n=${ROLLOUT_N}"

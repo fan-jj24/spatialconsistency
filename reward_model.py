@@ -10,8 +10,9 @@
   - 下载: ModelScope snapshot_download（未配置本地路径时）。
   - GPU 推理: vLLM tensor parallel，默认 TP=8、bfloat16。
   - 批处理: HTTP 服务动态攒批后交给一次 ``LLM.generate``。
-  - 引擎调度: 不强制 eager 模式，不手工限制 KV cache 或显存比例，
-    由 vLLM 自动做显存 profiling 并选择 CUDA Graph 执行路径。
+  - 显存: 奖励引擎默认每卡只分配 1 GiB KV cache，并使用 eager 模式，
+    避免 CUDA Graph 和大 KV 预算挤占 VERL rollout/训练显存；Attention
+    backend 仍由 vLLM/PPU 自动选择，可继续使用平台支持的 Flash Attention。
   - 异常处理: 模型加载或推理失败时直接抛出异常，中断训练。
   - 线程安全: 加载和推理各用一把锁，避免 verl 多线程 reward 并发问题。
 
@@ -74,10 +75,17 @@ MODEL_NAME = os.environ.get("R4_MODEL_NAME", "Qwen/Qwen3.5-9B")
 MODEL_LOCAL_PATH = os.environ.get(
     "R4_MODEL_LOCAL_PATH", "/home/deepspeed/model_output/Qwen"
 ) or None
-# vLLM 会把约 18GB BF16 权重切到 8 卡。
+# vLLM 会把约 18GB BF16 权重切到 8 卡。显式 KV cache 预算更适合
+# 与 VERL 共卡：它不会为了短分类请求预留数 GiB 无用 KV cache。
 VLLM_DTYPE = os.environ.get("R4_VLLM_DTYPE", "bfloat16")
 VLLM_TENSOR_PARALLEL_SIZE = int(
     os.environ.get("R4_VLLM_TENSOR_PARALLEL_SIZE", "8")
+)
+VLLM_KV_CACHE_BYTES = int(
+    os.environ.get("R4_VLLM_KV_CACHE_BYTES", str(1024**3))
+)
+VLLM_GPU_MEMORY_UTILIZATION = float(
+    os.environ.get("R4_VLLM_GPU_MEMORY_UTILIZATION", "0.08")
 )
 VLLM_MAX_NUM_SEQS = int(os.environ.get("R4_VLLM_MAX_NUM_SEQS", "32"))
 VLLM_LOGPROBS = int(os.environ.get("R4_VLLM_LOGPROBS", "128"))
@@ -90,6 +98,10 @@ if MAX_INPUT_TOKENS <= 0 or MAX_SUMMARY_TOKENS <= 0:
     raise ValueError("R4 token limits must be positive")
 if VLLM_TENSOR_PARALLEL_SIZE <= 0:
     raise ValueError("R4_VLLM_TENSOR_PARALLEL_SIZE must be positive")
+if VLLM_KV_CACHE_BYTES < 0:
+    raise ValueError("R4_VLLM_KV_CACHE_BYTES must be non-negative")
+if not 0.0 < VLLM_GPU_MEMORY_UTILIZATION <= 1.0:
+    raise ValueError("R4_VLLM_GPU_MEMORY_UTILIZATION must be within (0, 1]")
 if VLLM_MAX_NUM_SEQS <= 0:
     raise ValueError("R4_VLLM_MAX_NUM_SEQS must be positive")
 if VLLM_LOGPROBS < len(("A", "B", "C", "D")):
@@ -399,15 +411,21 @@ class RewardModel:
                     "max_model_len": MAX_INPUT_TOKENS + 1,
                     "max_num_seqs": VLLM_MAX_NUM_SEQS,
                     "max_logprobs": VLLM_LOGPROBS,
+                    # 仅关闭 CUDA Graph；不会禁用 Flash Attention backend。
+                    "enforce_eager": True,
                     "enable_chunked_prefill": True,
                     "enable_prefix_caching": True,
                     "distributed_executor_backend": "mp",
+                    "gpu_memory_utilization": VLLM_GPU_MEMORY_UTILIZATION,
                     # R4 只处理文本，不加载/预留 Qwen3.5 的视觉路径。
                     "language_model_only": True,
                     "skip_mm_profiling": True,
                     "mm_processor_cache_gb": 0,
                     "seed": 0,
                 }
+                if VLLM_KV_CACHE_BYTES:
+                    # 设置后 vLLM 不再按 gpu_memory_utilization 自动吃满预算。
+                    llm_kwargs["kv_cache_memory_bytes"] = VLLM_KV_CACHE_BYTES
 
                 self._llm = LLM(**llm_kwargs)
                 self._tokenizer = self._llm.get_tokenizer()
@@ -435,9 +453,10 @@ class RewardModel:
                 self._loaded = True
                 logger.info(
                     "Reward model loaded. choice_token_ids=%s, "
-                    "min_choice_mass=%s, max_num_seqs=%d",
+                    "min_choice_mass=%s, kv_cache_bytes=%s, max_num_seqs=%d",
                     self._choice_token_ids,
                     MIN_CHOICE_MASS,
+                    VLLM_KV_CACHE_BYTES or "auto",
                     VLLM_MAX_NUM_SEQS,
                 )
             except Exception as e:
