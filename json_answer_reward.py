@@ -36,18 +36,18 @@ JSON RLVR Reward Function（分类奖励框架）
       C=1 且预测 boxes 也为空 → R=1.0
       C=1 且预测 boxes 非空   → R=0.2
     GT boxes 非空（负例）:
-      R = C × (0.2 + 0.7×R2 + 0.1×R3)
+      R = C × (0.1 + 0.25×R2 + 0.25×R3 + 0.4×R4)
       C  = answer 门控（0/1）
       R2 = GT 所有框并集 vs 预测所有框并集 的 IoU（栅格化）
       R3 = 关键词子集召回 × IoU × 方向系数（含格式门控），详见下方
-  值域:        [0, 1] 连续值
+  值域:        [-0.15, 1] 连续值（R3 格式门控可返回 -1）
 
 ━━━ 第四类: spatial_detection 组合奖励 ━━━
   data_source: spatial_detection
   GT:          同第三类结构（全负例，无正例空框分支）
-  逻辑:        R = 0.85×R2 + 0.15×R3
+  逻辑:        R = 0.25×R2 + 0.25×R3 + 0.5×R4
               无 C 门控，无正例分支
-  值域:        [0, 1] 连续值
+  值域:        [-0.25, 1] 连续值（R3 格式门控可返回 -1）
 
 ━━━ R2/R3/R4 子项详解（第三、四类共用）━━━
   R2（并集 IoU）:
@@ -106,8 +106,8 @@ JSON RLVR Reward Function（分类奖励框架）
           禁止静默去掉 R4 后继续训练。
 
     在第三/四类中的权重:
-      第三类: R = C × (0.15 + 0.65×R2 + 0.1×R3 + 0.1×R4)
-      第四类: R = 0.75×R2 + 0.15×R3 + 0.1×R4
+      第三类: R = C × (0.1 + 0.25×R2 + 0.25×R3 + 0.4×R4)
+      第四类: R = 0.25×R2 + 0.25×R3 + 0.5×R4
 ━━━ 设计约束 ━━━
   - 第一类保持严格 0/1 二值: DAPO 的 filter_groups.metric=acc 依赖
     组内二值对错来过滤全对/全错 group。
@@ -759,7 +759,7 @@ def score_spatial_consistency_bbox(solution_str, ground_truth):
     GT boxes 为空（正例）:
       C=0 → R=0;  C=1 且预测空 → 1.0;  C=1 且预测非空 → 0.2
     GT boxes 非空（负例）:
-      R = C × (0.15 + 0.65×R2 + 0.1×R3 + 0.1×R4)
+      R = C × (0.1 + 0.25×R2 + 0.25×R3 + 0.4×R4)
 
     R3 已融入 IoU 缩放和方向系数（原方向 R4）。
     R4 为 summary 一致性校验（Qwen3.5-9B 奖励模型）。
@@ -787,7 +787,7 @@ def score_spatial_consistency_bbox(solution_str, ground_truth):
     matches = _hungarian_match(gt_entries, pred_entries)
     r3 = _score_r3(gt_entries, pred_entries, matches)
     r4 = _score_r4(pred_obj, gt_obj)
-    return c * (0.15 + 0.65 * r2 + 0.1 * r3 + 0.1 * r4)
+    return c * (0.1 + 0.25 * r2 + 0.25 * r3 + 0.4 * r4)
 
 
 # ============================================================
@@ -797,7 +797,7 @@ def score_spatial_consistency_bbox(solution_str, ground_truth):
 def score_spatial_detection(solution_str, ground_truth):
     """第四类奖励: spatial_detection 组合奖励（全负例，无门控）。
 
-    R = 0.75×R2 + 0.15×R3 + 0.1×R4
+    R = 0.25×R2 + 0.25×R3 + 0.5×R4
     GT 结构同第三类，但无 C 门控、无正例空框分支。
 
     R3 已融入 IoU 缩放和方向系数（原方向 R4）。
@@ -811,7 +811,7 @@ def score_spatial_detection(solution_str, ground_truth):
     matches = _hungarian_match(gt_entries, pred_entries)
     r3 = _score_r3(gt_entries, pred_entries, matches)
     r4 = _score_r4(pred_obj, gt_obj)
-    return 0.75 * r2 + 0.15 * r3 + 0.1 * r4
+    return 0.25 * r2 + 0.25 * r3 + 0.5 * r4
 
 
 # ============================================================
@@ -951,7 +951,7 @@ if __name__ == "__main__":
         else:
             print(f"  [INFO] {i+1:2d}. {desc}: reward={score:.4f}")
 
-    # --- 第三类测试 (R = C×(0.15+0.65×R2+0.1×R3+0.1×R4)) ---
+    # --- 第三类测试 (R = C×(0.1+0.25×R2+0.25×R3+0.4×R4)) ---
     # 这里只回归组合公式，固定 R4=1.0，避免把模型概率波动写成精确断言。
     # reward_model.py 的 __main__ 单独负责真实模型的单条/批量推理测试。
     _r4_score_summary_fn = lambda pred, gt: 1.0
@@ -975,39 +975,39 @@ if __name__ == "__main__":
         (SCB_POS, scb_think + '{"answer": "A", "boxes": []}', gt_pos, 1.0, "正例预测空=满分"),
         (SCB_POS, scb_think + '{"answer": "A", "boxes": [{"bbox":[0,0,10,10],"label":"background"}]}',
          gt_pos, 0.2, "正例预测非空=0.2"),
-        # 负例完美匹配: R2=1, R3=1, R4=1 → R = 0.15+0.65+0.1+0.1 = 1.0
+        # 负例完美匹配: R2=1, R3=1, R4=1 → R = 0.1+0.25+0.25+0.4 = 1.0
         (SCB_NEG, scb_think + '{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move (100, 50)"}]}',
          gt_neg, 1.0, "负例完美匹配=1.0"),
         # 负例部分重叠: R2=1/7, R3: dir=0 → R3=0, R4=1
-        #   R = 0.15 + 0.65/7 + 0 + 0.1 = 0.3429
+        #   R = 0.1 + 0.25/7 + 0 + 0.4 = 0.5357
         (SCB_NEG, scb_think + '{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [50,50,150,150], "label": "move (100, 50)"}]}',
-         gt_neg, 0.15 + 0.65/7 + 0.1, "负例部分重叠(方向垂直dir=0)"),
-        # 负例完全不重叠: R2=0, R3=0, R4=1 → R = 0.15 + 0 + 0 + 0.1 = 0.25
+         gt_neg, 0.1 + 0.25/7 + 0.4, "负例部分重叠(方向垂直dir=0)"),
+        # 负例完全不重叠: R2=0, R3=0, R4=1 → R = 0.1 + 0 + 0 + 0.4 = 0.5
         (SCB_NEG, scb_think + '{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [500,500,600,600], "label": "move (100, 50)"}]}',
-         gt_neg, 0.25, "负例不重叠(IoU=0拉零R3)"),
+         gt_neg, 0.5, "负例不重叠(IoU=0拉零R3)"),
         # R3 说多了: pred 含 delete → kw=0 → R3=0, R4=1
-        #   R = 0.15 + 0.65 + 0 + 0.1 = 0.9
+        #   R = 0.1 + 0.25 + 0 + 0.4 = 0.75
         (SCB_NEG, scb_think + '{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move and delete (100, 50)"}]}',
-         gt_neg, 0.9, "R3说多了kw=0"),
+         gt_neg, 0.75, "R3说多了kw=0"),
         # R3 说少了: GT={move,rotate}, pred={move} → kw=1/2, R3=0.5, R4=1
-        #   R = 0.15 + 0.65 + 0.05 + 0.1 = 0.95
+        #   R = 0.1 + 0.25 + 0.125 + 0.4 = 0.875
         (SCB_NEG, scb_think + '{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move (100, 50)"}]}',
-         gt_neg2, 0.95, "R3说少了按召回给半分"),
+         gt_neg2, 0.875, "R3说少了按召回给半分"),
         # 格式门控: pred 有 move 但无箭头 → R3=-1, R4=1
-        #   R = 0.15 + 0.65 - 0.1 + 0.1 = 0.8
+        #   R = 0.1 + 0.25 - 0.25 + 0.4 = 0.5
         (SCB_NEG, scb_think + '{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move"}]}',
-         gt_neg, 0.8, "格式门控:move无箭头→R3=-1"),
+         gt_neg, 0.5, "格式门控:move无箭头→R3=-1"),
         # 格式门控: pred 无 move 但有箭头 → R3=-1, R4=1
         (SCB_NEG, scb_think + '{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "rotate (100, 50)"}]}',
-         gt_neg, 0.8, "格式门控:无move有箭头→R3=-1"),
+         gt_neg, 0.5, "格式门控:无move有箭头→R3=-1"),
         # 格式门控: pred 有 move 且多组向量 → R3=-1, R4=1
         (SCB_NEG, scb_think + '{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move (100, 50) (200, 50)"}]}',
-         gt_neg, 0.8, "格式门控:多组向量→R3=-1"),
-        # 方向反向: dir=-1, R3=-1, R4=1 → R = 0.15 + 0.65 - 0.1 + 0.1 = 0.8
+         gt_neg, 0.5, "格式门控:多组向量→R3=-1"),
+        # 方向反向: dir=-1, R3=-1, R4=1 → R = 0.1 + 0.25 - 0.25 + 0.4 = 0.5
         (SCB_NEG, scb_think + '{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move (0, 50)"}]}',
-         gt_neg, 0.8, "方向反向dir=-1"),
+         gt_neg, 0.5, "方向反向dir=-1"),
         # GT move 无箭头, pred move 有箭头 → dir_coef=1, R3=1, R4=1
-        #   R = 0.15 + 0.65 + 0.1 + 0.1 = 1.0
+        #   R = 0.1 + 0.25 + 0.25 + 0.4 = 1.0
         (SCB_NEG, scb_think + '{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move (100, 50)"}]}',
          gt_neg_noarrow, 1.0, "GT无箭头pred有箭头dir=1"),
         # 单词前缀匹配: pred "moved (100, 50)" 匹配 move → R3=1, R4=1
@@ -1045,7 +1045,7 @@ if __name__ == "__main__":
         ("spatial_consistency_bbox_pos",
          scb_think + '{"answer": "A", "boxes": []}',
          gt_pos, 1.0),
-        # R2=1, R3=1, R4=1 → R = 0.75+0.15+0.1 = 1.0
+        # R2=1, R3=1, R4=1 → R = 0.25+0.25+0.5 = 1.0
         ("spatial_detection",
          '{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move (100, 50)"}]}',
          sd_gt_route, 1.0),
@@ -1060,32 +1060,32 @@ if __name__ == "__main__":
         else:
             print(f"  [INFO] {ds}: reward={score:.4f}")
 
-    # --- 第四类测试 (R = 0.75×R2 + 0.15×R3 + 0.1×R4) ---
+    # --- 第四类测试 (R = 0.25×R2 + 0.25×R3 + 0.5×R4) ---
     print("\n=== 第四类: spatial_detection 组合奖励 ===\n")
     sd_gt = ('{"answer": "B", "summary": "inconsistent", '
              '"boxes": [{"bbox": [0,0,100,100], "label": "move (100, 50)"}]}')
     cases_4 = [
-        # 完美匹配: R2=1, R3=1, R4=1 → R = 0.75+0.15+0.1 = 1.0
+        # 完美匹配: R2=1, R3=1, R4=1 → R = 0.25+0.25+0.5 = 1.0
         ('{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move (100, 50)"}]}',
          sd_gt, 1.0, "完美匹配=1.0"),
         # 部分重叠: R2=1/7, R3: dir=0 → R3=0, R4=1
-        #   R = 0.75/7 + 0 + 0.1 = 0.2071
+        #   R = 0.25/7 + 0 + 0.5 = 0.5357
         ('{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [50,50,150,150], "label": "move (100, 50)"}]}',
-         sd_gt, 0.75/7 + 0.1, "部分重叠(方向垂直dir=0)"),
-        # 完全不重叠: R2=0, R3=0, R4=1 → R = 0 + 0 + 0.1 = 0.1
+         sd_gt, 0.25/7 + 0.5, "部分重叠(方向垂直dir=0)"),
+        # 完全不重叠: R2=0, R3=0, R4=1 → R = 0 + 0 + 0.5 = 0.5
         ('{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [500,500,600,600], "label": "move (100, 50)"}]}',
-         sd_gt, 0.1, "不重叠(IoU=0拉零R3)"),
-        # 预测无框: R2=0, 无匹配 → R3=0, R4=1 → R = 0.1
-        ('{"answer": "B", "summary": "inconsistent", "boxes": []}', sd_gt, 0.1, "预测无框(R4=0.1)"),
-        # R3 说多了: pred 含 delete → kw=0 → R3=0, R4=1 → R = 0.75 + 0.1 = 0.85
+         sd_gt, 0.5, "不重叠(IoU=0拉零R3)"),
+        # 预测无框: R2=0, 无匹配 → R3=0, R4=1 → R = 0.5
+        ('{"answer": "B", "summary": "inconsistent", "boxes": []}', sd_gt, 0.5, "预测无框(R4=0.5)"),
+        # R3 说多了: pred 含 delete → kw=0 → R3=0, R4=1 → R = 0.25 + 0.5 = 0.75
         ('{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move and delete (100, 50)"}]}',
-         sd_gt, 0.85, "R3说多了kw=0"),
-        # 格式门控: pred move 无箭头 → R3=-1, R4=1 → R = 0.75 - 0.15 + 0.1 = 0.7
+         sd_gt, 0.75, "R3说多了kw=0"),
+        # 格式门控: pred move 无箭头 → R3=-1, R4=1 → R = 0.25 - 0.25 + 0.5 = 0.5
         ('{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move"}]}',
-         sd_gt, 0.75 - 0.15 + 0.1, "格式门控:move无箭头→R3=-1"),
-        # 方向反向: dir=-1, R3=-1, R4=1 → R = 0.75 - 0.15 + 0.1 = 0.7
+         sd_gt, 0.5, "格式门控:move无箭头→R3=-1"),
+        # 方向反向: dir=-1, R3=-1, R4=1 → R = 0.25 - 0.25 + 0.5 = 0.5
         ('{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move (0, 50)"}]}',
-         sd_gt, 0.75 - 0.15 + 0.1, "方向反向dir=-1"),
+         sd_gt, 0.5, "方向反向dir=-1"),
     ]
     for i, (sol, gt, exp, desc) in enumerate(cases_4):
         score = compute_score("spatial_detection", sol, gt)

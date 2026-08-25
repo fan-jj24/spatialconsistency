@@ -2,9 +2,9 @@
 # ============================================================
 # RL1 正式训练脚本 — verl 0.8.0 DAPO recipe
 #
-# 权重: /home/deepspeed/model_output/Qwen_SFT2_hf (SFT2 输出)
-# 数据: /home/deepspeed/model_output/RL1 (11 个数据集, 39680 条)
-# 训练: 2 epoch, LR=5e-7, warmup 10 步, ppo_epochs=1
+# 权重: /home/deepspeed/model_output/Qwen_SFT
+# 数据: /home/deepspeed/model_output/RL1 (5 个数据集目录)
+# 训练: 5 epoch, LR=5e-7, warmup 10 步, ppo_epochs=1
 #
 # 关键配置:
 #   - ppo_epochs=1: 每个 rollout batch 只做一次策略更新，
@@ -12,19 +12,14 @@
 #   - gpu_memory_utilization=0.7: 给 checkpoint 保存留出显存
 #     (0.75 时初始保存 OOM: 需要 7.74 GiB, 只剩 7.37 GiB;
 #      0.7 可多腾出 ~4.8 GiB, 预计够用; 若仍 OOM 降到 0.65)
-#   - filter_overlong_prompts=False: max_prompt_length=2048 已覆盖,
-#     不再做耗时的逐条长度过滤
+#   - filter_overlong_prompts=False: 不做耗时的逐条长度过滤，
+#     超过 max_prompt_length=1600 的 prompt 从左侧截断
 #   - FREEZE_VISION=1 可选: 冻结 vision tower
 #     (依赖已打过的 patch_freeze_vision_sft.py 补丁)
 #
-# 步数估算:
-#   39680 条 / train_batch_size 128 = 310 个 gen batch
-#   DAPO dynamic sampling 每步约消耗 3 个 gen batch → 约 100 个优化步
-#   warmup = 0.03 × total_training_steps(310) ≈ 9 步
-#
 # 用法:
-#   bash run_rl1.sh                        # 全参数训练
-#   FREEZE_VISION=1 bash run_rl1.sh        # 冻结 vision（推荐）
+#   bash rl.sh                        # 全参数训练
+#   FREEZE_VISION=1 bash rl.sh        # 冻结 vision（推荐）
 # ============================================================
 
 set -euo pipefail
@@ -32,7 +27,7 @@ set -euo pipefail
 # ------------------------------------------------------------
 # 路径
 # ------------------------------------------------------------
-MODEL_PATH=${MODEL_PATH:-"/home/deepspeed/model_output/Qwen_SFT2_hf"}
+MODEL_PATH=${MODEL_PATH:-"/home/deepspeed/model_output/Qwen_SFT"}
 VERL_ROOT=${VERL_ROOT:-"/home/deepspeed/qwen/verl080"}
 DATA_ROOT=${DATA_ROOT:-"/home/deepspeed/model_output/RL1"}
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -59,11 +54,11 @@ export R4_VLLM_MAX_NUM_SEQS=${R4_VLLM_MAX_NUM_SEQS:-${R4_SERVER_MAX_BATCH_SIZE}}
 export R4_VLLM_LOGPROBS=${R4_VLLM_LOGPROBS:-128}
 R4_VLLM_WORKER_MULTIPROC_METHOD=${R4_VLLM_WORKER_MULTIPROC_METHOD:-spawn}
 
-# 11 个数据集目录
+# 5 个数据集目录
 DATASET_NAMES=(
     "consistent_cot_verl"
-    "inconsistent_cot_verl"
-    "inconsistent_detection_verl_cot"
+    "inconsistent_cot_verl_2500"
+    "inconsistent_detection_verl_cot_2500"
     "consistent_all"
     "inconsistent_all"
 )
@@ -110,8 +105,8 @@ TOTAL_EPOCHS=${TOTAL_EPOCHS:-5}
 USE_DYNAMIC_BSZ=${USE_DYNAMIC_BSZ:-false}
 
 # ---- 序列长度 ----
-# max_prompt_length=2048 已覆盖全部样本（audit 过），不做长度过滤
-MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
+# 不做长度过滤；超长 prompt 按 data.truncation=left 截断
+MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1600}
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-4096}
 ROLLOUT_PROMPT_LENGTH=${ROLLOUT_PROMPT_LENGTH:-2048}
 
@@ -270,7 +265,7 @@ DATA=(
     data.max_prompt_length=${MAX_PROMPT_LENGTH}
     data.max_response_length=${MAX_RESPONSE_LENGTH}
     data.train_batch_size=${TRAIN_BATCH_SIZE}
-    # 不做逐条长度过滤（耗时；2048 已覆盖全部样本，超长走 left 截断）
+    # 不做逐条长度过滤（耗时；超长走 left 截断）
     data.filter_overlong_prompts=False
 )
 
