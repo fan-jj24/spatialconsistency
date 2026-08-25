@@ -165,6 +165,14 @@ def _as_reward_string(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def _dataset_source(root, path):
+    """Return IVG's source label: the dataset directory below data_root."""
+    if root.is_file():
+        return root.stem
+    relative = path.relative_to(root)
+    return relative.parts[0] if len(relative.parts) > 1 else path.stem
+
+
 def _iter_source_rows(data_root):
     root = Path(data_root).expanduser().resolve()
     if not root.exists():
@@ -184,10 +192,14 @@ def _iter_source_rows(data_root):
             rows = pq.read_table(path).to_pylist()
         else:
             continue
-        fallback_source = path.parent.name if path.parent != root else path.stem
+        # Follow inspect_val_generations.py's grouping convention: ``source``
+        # is the dataset directory directly below data_root, not data_source
+        # and not an optional field embedded in a row.  A file directly under
+        # data_root has no dataset directory, so use its stem as a fallback.
+        dataset_source = _dataset_source(root, path)
         for row in rows:
             if isinstance(row, dict):
-                yield row, fallback_source, path
+                yield row, dataset_source, path
 
 
 @dataclass(frozen=True)
@@ -208,15 +220,14 @@ class SourceIndex:
         self.cache = {}
 
     def match(self, record):
+        # A val_generations JSONL usually contains data_source, but that only
+        # selects the reward route.  It cannot identify the original dataset
+        # directory, so always trace the prompt back through the source index.
         explicit = record.get("data_source")
-        if isinstance(explicit, str) and explicit:
-            source = record.get("source") or explicit
-            return SourceEntry("", explicit, str(source),
-                               _as_reward_string(_ground_truth(record)), "<val>")
-
+        explicit = explicit if isinstance(explicit, str) and explicit else ""
         key = prompt_key(record.get("input", record.get("prompt", "")))
         gt = _as_reward_string(_ground_truth(record))
-        cache_key = (key, gt)
+        cache_key = (key, gt, explicit)
         if cache_key in self.cache:
             return self.cache[cache_key]
 
@@ -232,11 +243,17 @@ class SourceIndex:
             same_gt = [item for item in candidates if item.ground_truth == gt]
             if same_gt:
                 candidates = same_gt
-        # The same validation row may occur in several source shards.  It is
-        # unambiguous when all duplicates resolve to the same source/category.
-        identities = {(item.data_source, item.source, item.ground_truth)
-                      for item in candidates}
-        result = candidates[0] if len(identities) == 1 else None
+        # Match IVG's original behavior: after prompt and GT filtering, take
+        # the first source hit when duplicate rows remain.
+        result = None
+        if candidates:
+            item = candidates[0]
+            data_source = explicit or item.data_source
+            if data_source:
+                result = SourceEntry(
+                    item.key, data_source, item.source,
+                    item.ground_truth, item.path,
+                )
         self.cache[cache_key] = result
         return result
 
@@ -244,20 +261,20 @@ class SourceIndex:
 def build_index(data_root):
     entries = []
     skipped = 0
-    for row, fallback_source, path in _iter_source_rows(data_root):
+    for row, dataset_source, path in _iter_source_rows(data_root):
         key = prompt_key(row.get("prompt", row.get("input", row.get("messages", ""))))
         data_source = row.get("data_source")
-        if not key or not isinstance(data_source, str) or not data_source:
+        if not key:
             skipped += 1
             continue
-        source = row.get("source") or data_source or fallback_source
+        if not isinstance(data_source, str):
+            data_source = ""
         entries.append(SourceEntry(
-            key, data_source, str(source), _as_reward_string(_ground_truth(row)), str(path)
+            key, data_source, dataset_source,
+            _as_reward_string(_ground_truth(row)), str(path)
         ))
     if not entries:
-        raise RuntimeError(
-            "源数据中没有可索引的 prompt + data_source 记录"
-        )
+        raise RuntimeError("源数据中没有可索引的 prompt 记录")
     print(f"  索引条目: {len(entries)}，跳过: {skipped}")
     return SourceIndex(entries)
 
@@ -315,12 +332,11 @@ def decompose_case(case, reward):
         c = float(gt_answer is not None and pred_answer is not None
                   and gt_answer == pred_answer)
         case.metrics["C"] = c
-        if c == 0.0:
-            case.metrics["reward"] = 0.0
-            return
         if not gt_entries:  # Positive branch never calls R4 in training.
-            case.metrics["reward"] = 1.0 if not pred_entries else 0.2
+            case.metrics["reward"] = c * (1.0 if not pred_entries else 0.2)
             return
+        # For negative bbox cases, compute diagnostic R2/R3/R4 even when C=0.
+        # The final reward remains zero through the C multiplier below.
         case.metrics["R2"] = reward._score_r2(gt_entries, pred_entries)
         case.metrics["R3"] = reward._score_r3(gt_entries, pred_entries, matches)
     elif ds in reward.SPATIAL_DETECTION_SOURCES:
