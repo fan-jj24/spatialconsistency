@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""R4 奖励模型: Qwen3.5-0.8B 双向 summary 语义校验。
+"""R4 奖励模型: Qwen3.5-0.8B summary 语义四分类。
 
 在 verl RLVR 奖励框架中，R4 负责校验模型输出的 summary 与 GT summary
 是否语义一致。使用 Qwen/Qwen3.5-0.8B（0.8B VLM）作为判官模型，
@@ -21,29 +21,25 @@
     # 批量
     scores = rm.score_summaries([(pred1, gt1), (pred2, gt2)])
 
-打分方案: Support/Coverage 双向 3 档分类 + forward logits 加权
-  对每对 summary 分别判断：
-  1. Support：预测中的事实是否都被真值支持；
-  2. Coverage：预测是否覆盖真值中的全部事实。
+打分方案: 单次 4 档互斥错误类型分类 + forward logits 加权
+  每对 summary 只判断一次：
+    A = 完全语义等价；
+    B = 候选内容正确但不完整，仅有漏报；
+    C = 有正确重合，但也有错报、无依据细节或矛盾；
+    D = 没有任何实质事实匹配。
 
-  一批 N 对 summary 会构造 2N 个 prompt，并在同一次 backbone forward
-  中完成判断，不 generate。只取每个 prompt 最后有效位置的
-  hidden state 计算词表 logits，同时得到 A/B/C 的三分类概率与
-  它们在整个词表中的总概率。
+  一批 N 对 summary 只构造 N 个 prompt，在一次 backbone forward 中完成
+  判断，不 generate。连续奖励为：
+    R4 = P(A) + 0.50 * P(B) + 0.25 * P(C)
 
-  两个方向的连续分数为：
-    support  = P(all) + 0.25 * P(partial)
-    coverage = P(all) + 0.50 * P(partial)
-    R4       = support * coverage
+  固定标签并在 prompt 中提供四个短示例。聊天模板显式使用
+  ``enable_thinking=False``，确保 assistant 的第一个输出 token 就是
+  分类答案，而不是思考内容。
 
-  固定 A=all、B=partial、C=none。对 0.8B 模型，固定标签比每条样本
-  重排选项更稳定。聊天模板显式使用 ``enable_thinking=False``，确保
-  assistant 的第一个输出 token 就是分类答案，而不是思考内容。
-
-  模型仍然只需从 A/B/C 三个选项中选一个，只做一次 backbone forward，
+  模型只需从 A/B/C/D 四个选项中选一个，只做一次 backbone forward，
   不 generate。只在每个 prompt 的最后一个 hidden state 上计算完整词表
-  logits，用于确认 A/B/C 的绝对概率质量；不会构造
-  ``batch × sequence × vocabulary`` 的大张量。若三个选项的总概率过低，
+  logits，用于确认 A/B/C/D 的绝对概率质量；不会构造
+  ``batch × sequence × vocabulary`` 的大张量。若四个选项的总概率过低，
   说明模型没有在做要求的分类，直接报错中断训练。
 
   forward 比 generate 更好: 确定性，无采样噪声，不会两次结果不一致，
@@ -51,14 +47,13 @@
 
   不用 argmax（离散值，单条和 batch 的 padding 差异会导致 argmax
   翻转，结果不一致）。用概率加权得到连续值，和旧方案 P(yes) 一样
-  的思路，只是从 2 元变 3 元。
+  的思路，只是从 2 元变 4 元。
 
-  token id 获取: 只接受严格的大写 ``A``/``B``/``C`` 单 token，不再将
+  token id 获取: 只接受严格的大写 ``A``/``B``/``C``/``D`` 单 token，不再将
   小写或带空格的 token 与大写答案合并取最大 logit。
 
-  3 档而非 5 档: 0.8B 模型对 5 档区分能力不足。双向判断把复杂的整段
-  相似度拆成两个较简单的 all/partial/none 分类，同时能分别处罚错报和
-  漏报。
+  四类不是模糊的好坏等级，而是互斥的错误类型。这样模型能明确区分
+  “只漏报”和“有错报”，同时避免双向分类相乘放大两个判断的误差。
 
   prompt 用英文（与 summary 语言一致），避免跨语言理解力下降。
 
@@ -92,7 +87,7 @@ MODEL_LOCAL_PATH = os.environ.get(
 TORCH_DTYPE = "bfloat16"
 DEVICE = "cpu"
 
-# ── 输入及 3 档分类配置 ──
+# ── 输入及四分类配置 ──
 MAX_INPUT_TOKENS = int(os.environ.get("R4_MAX_INPUT_TOKENS", "2048"))
 MAX_SUMMARY_TOKENS = int(os.environ.get("R4_MAX_SUMMARY_TOKENS", "640"))
 MIN_CHOICE_MASS = float(os.environ.get("R4_MIN_CHOICE_MASS", "0.01"))
@@ -101,12 +96,8 @@ if MAX_INPUT_TOKENS <= 0 or MAX_SUMMARY_TOKENS <= 0:
 if not math.isfinite(MIN_CHOICE_MASS) or not 0.0 <= MIN_CHOICE_MASS <= 1.0:
     raise ValueError("R4_MIN_CHOICE_MASS must be finite and within [0, 1]")
 
-CHOICE_LETTERS = ("A", "B", "C")
-OUTCOMES = ("all", "partial", "none")
-LETTER_TO_OUTCOME = dict(zip(CHOICE_LETTERS, OUTCOMES))
-
-SUPPORT_WEIGHTS = {"all": 1.0, "partial": 0.25, "none": 0.0}
-COVERAGE_WEIGHTS = {"all": 1.0, "partial": 0.50, "none": 0.0}
+CHOICE_LETTERS = ("A", "B", "C", "D")
+CHOICE_WEIGHTS = (1.0, 0.50, 0.25, 0.0)
 
 # ── Prompt 模板（英文）──
 SYSTEM_PROMPT = (
@@ -118,61 +109,48 @@ SYSTEM_PROMPT = (
     "right of woman'. Judge each clause separately. Entity, direction, position, "
     "distance, orientation, posture, count, attributes, added/missing status, "
     "polarity, and uncertainty are material. A wrong entity or opposite value is a "
-    "conflict. 'Consistent', 'different', and 'uncertain' are distinct conclusions."
+    "conflict. 'Consistent', 'different', and 'uncertain' are distinct conclusions.\n\n"
+    "Use these examples:\n"
+    "Reference: The man is right of the woman.\n"
+    "Candidate: The woman is left of the man.\n"
+    "Answer: A\n\n"
+    "Reference: The woman moved left. The chair disappeared.\n"
+    "Candidate: The woman moved left.\n"
+    "Answer: B\n\n"
+    "Reference: The woman moved left.\n"
+    "Candidate: The woman moved left. The chair disappeared.\n"
+    "Answer: C\n\n"
+    "Reference: The woman moved left.\n"
+    "Candidate: The woman moved right.\n"
+    "Answer: D"
 )
 USER_TEMPLATE = (
     "REFERENCE:\n<reference>\n{gt}\n</reference>\n\n"
     "CANDIDATE:\n<candidate>\n{pred}\n</candidate>\n\n"
-    "{question}\n"
-    "{options}\n"
-    "Return exactly one uppercase letter: A, B, or C."
+    "Classify the relationship using exactly one category:\n"
+    "A - Complete semantic match. Every material fact matches in both directions.\n"
+    "B - Correct but incomplete. Every candidate fact is supported, but at least "
+    "one reference fact is omitted.\n"
+    "C - Mixed. At least one material fact matches, but the candidate also contains "
+    "an unsupported detail, wrong fact, or contradiction.\n"
+    "D - No material fact matches. Pure contradictions belong here.\n"
+    "Return exactly one uppercase letter: A, B, C, or D."
 )
-
-JUDGMENT_SPECS = {
-    "support": {
-        "question": "Are all candidate facts supported by the reference?",
-        "descriptions": {
-            "all": "Every material candidate fact is supported by the reference.",
-            "partial": (
-                "At least one material candidate fact matches, but another fact or "
-                "detail is unsupported or contradictory."
-            ),
-            "none": "No material candidate fact matches the reference.",
-        },
-        "weights": SUPPORT_WEIGHTS,
-    },
-    "coverage": {
-        "question": "Does the candidate cover all reference facts?",
-        "descriptions": {
-            "all": "The candidate conveys every material fact in the reference.",
-            "partial": (
-                "The candidate conveys at least one, but not all, material reference "
-                "facts, or misses a required detail."
-            ),
-            "none": "The candidate conveys none of the material reference facts.",
-        },
-        "weights": COVERAGE_WEIGHTS,
-    },
-}
 
 
 @dataclass(frozen=True)
 class JudgmentPrompt:
     text: str
-    letter_scores: Tuple[float, float, float]
+    letter_scores: Tuple[float, float, float, float]
 
 
 @dataclass(frozen=True)
 class SummaryScore:
-    """单对 summary 的总分及双向分类诊断。"""
+    """单对 summary 的总分及四分类诊断。"""
 
     score: float
-    support_score: float
-    coverage_score: float
-    support_probabilities: Tuple[float, float, float]
-    coverage_probabilities: Tuple[float, float, float]
-    support_choice_mass: float
-    coverage_choice_mass: float
+    probabilities: Tuple[float, float, float, float]
+    choice_mass: float
 
 
 class RewardModel:
@@ -187,7 +165,7 @@ class RewardModel:
         self._load_lock = threading.Lock()
         self._infer_lock = threading.Lock()
         self._loaded = False
-        self._choice_token_ids = None  # {"A": [id], "B": [id], "C": [id]}
+        self._choice_token_ids = None  # {"A": [id], ..., "D": [id]}
         self._backbone = None
         self._lm_head_weight = None
         self._lm_head_bias = None
@@ -260,14 +238,14 @@ class RewardModel:
                 )
                 self._model.eval()
 
-                # 预计算 A/B/C 的 token ids（严格验证）
+                # 预计算 A/B/C/D 的 token ids（严格验证）
                 self._choice_token_ids = self._get_choice_token_ids()
                 if any(
                     not self._choice_token_ids[letter]
                     for letter in CHOICE_LETTERS
                 ):
                     raise RuntimeError(
-                        "Cannot find valid choice token ids for A/B/C"
+                        "Cannot find valid choice token ids for A/B/C/D"
                     )
                 self._prepare_choice_head()
 
@@ -286,7 +264,7 @@ class RewardModel:
         self._ensure_loaded()
 
     def _get_choice_token_ids(self) -> dict:
-        """获取严格大写 A/B/C 的单 token id。
+        """获取严格大写 A/B/C/D 的单 token id。
 
         Prompt 要求返回一个大写字母，因此不接受小写、前置空格
         或其他 token 变体。若当前 tokenizer 不能将某个选项编码成
@@ -311,14 +289,14 @@ class RewardModel:
                 )
             result[letter] = [token_id]
         if len({ids[0] for ids in result.values()}) != len(CHOICE_LETTERS):
-            raise RuntimeError(f"A/B/C do not have distinct token ids: {result!r}")
+            raise RuntimeError(f"A/B/C/D do not have distinct token ids: {result!r}")
         return result
 
     def _prepare_choice_head(self):
-        """准备输出层及 A/B/C token 索引。
+        """准备输出层及 A/B/C/D token 索引。
 
         后续只对每个 prompt 的最后一个 hidden state 计算词表 logits，
-        以便同时得到三分类内部概率和 A/B/C 的绝对概率质量。
+        以便同时得到四分类内部概率和 A/B/C/D 的绝对概率质量。
         """
         self._backbone = self._model.base_model
         if self._backbone is self._model:
@@ -340,7 +318,7 @@ class RewardModel:
     def _hidden_to_choice_logits(
         self, last_hidden: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """返回 A/B/C logits 以及它们在整个词表中的总概率。"""
+        """返回 A/B/C/D logits 以及它们在整个词表中的总概率。"""
         full_logits = F.linear(
             last_hidden,
             self._lm_head_weight,
@@ -372,22 +350,11 @@ class RewardModel:
         self,
         pred_summary: str,
         gt_summary: str,
-        judgment: str,
     ) -> JudgmentPrompt:
-        """构建固定 A=all、B=partial、C=none 的判断 prompt。"""
-        if judgment not in JUDGMENT_SPECS:
-            raise ValueError(f"Unknown judgment type: {judgment!r}")
-
-        spec = JUDGMENT_SPECS[judgment]
-        options = "\n".join(
-            f"{letter} - {spec['descriptions'][LETTER_TO_OUTCOME[letter]]}"
-            for letter in CHOICE_LETTERS
-        )
+        """构建固定 A/B/C/D 错误类型的判断 prompt。"""
         user_text = USER_TEMPLATE.format(
             gt=gt_summary,
             pred=pred_summary,
-            question=spec["question"],
-            options=options,
         )
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -399,16 +366,12 @@ class RewardModel:
             add_generation_prompt=True,
             enable_thinking=False,
         )
-        letter_scores = tuple(
-            spec["weights"][LETTER_TO_OUTCOME[letter]]
-            for letter in CHOICE_LETTERS
-        )
-        return JudgmentPrompt(text=text, letter_scores=letter_scores)
+        return JudgmentPrompt(text=text, letter_scores=CHOICE_WEIGHTS)
 
     def _choice_logits_to_probabilities(
         self, choice_token_logits: torch.Tensor
     ) -> List[List[float]]:
-        """把候选 token logits 转为按 A/B/C 排列的概率。"""
+        """把候选 token logits 转为按 A/B/C/D 排列的概率。"""
         if choice_token_logits.ndim == 1:
             choice_token_logits = choice_token_logits.unsqueeze(0)
         if choice_token_logits.shape[1] != len(CHOICE_LETTERS):
@@ -422,9 +385,10 @@ class RewardModel:
 
     @staticmethod
     def _weighted_score(
-        probabilities: List[float], letter_scores: Tuple[float, float, float]
+        probabilities: List[float],
+        letter_scores: Tuple[float, float, float, float],
     ) -> float:
-        """按当前 prompt 的标签映射计算一个方向的连续分数。"""
+        """按 A=1、B=.5、C=.25、D=0 计算连续分数。"""
         if len(probabilities) != len(CHOICE_LETTERS):
             raise RuntimeError(
                 "R4 classifier returned the wrong number of probabilities: "
@@ -449,13 +413,13 @@ class RewardModel:
             for probability, weight in zip(checked_probabilities, letter_scores)
         )
         if not math.isfinite(score) or not 0.0 <= score <= 1.0:
-            raise ValueError(f"R4 directional score is invalid: {score!r}")
+            raise ValueError(f"R4 classifier score is invalid: {score!r}")
         return score
 
     def _infer_choice_probabilities(
         self, prompts: List[str]
     ) -> Tuple[List[List[float]], List[float]]:
-        """在一次 batch forward 中推理多个 A/B/C 判断。"""
+        """在一次 batch forward 中推理多个 A/B/C/D 判断。"""
         encoded = self._tokenizer(
             prompts,
             return_tensors="pt",
@@ -493,23 +457,23 @@ class RewardModel:
         for index, value in enumerate(choice_masses):
             if not math.isfinite(value) or not 0.0 <= value <= 1.0:
                 raise ValueError(
-                    f"R4 prompt {index} returned invalid A/B/C probability mass: "
+                    f"R4 prompt {index} returned invalid A/B/C/D probability mass: "
                     f"{value!r}"
                 )
             if value < MIN_CHOICE_MASS:
                 raise RuntimeError(
                     f"R4 prompt {index} assigned only {value:.6g} total "
-                    "probability to A/B/C, below R4_MIN_CHOICE_MASS="
+                    "probability to A/B/C/D, below R4_MIN_CHOICE_MASS="
                     f"{MIN_CHOICE_MASS:.6g}; the model is not following the "
                     "classification prompt"
                 )
         return self._choice_logits_to_probabilities(choice_logits), choice_masses
 
     def score_summary(self, pred_summary: str, gt_summary: str) -> float:
-        """以 Support × Coverage 校验单条 summary 语义一致性。
+        """以单次四分类校验单条 summary 语义一致性。
 
         Returns:
-            float ∈ [0, 1]: support × coverage。
+            float ∈ [0, 1]: 四分类概率加权分数。
 
         Raises:
             Exception: 模型加载或推理失败时原样抛出，由调用方中断训练。
@@ -519,16 +483,15 @@ class RewardModel:
     def score_summaries(
         self, pairs: List[Tuple[str, str]]
     ) -> List[float]:
-        """在一次 2N prompt forward 中批量计算 Support × Coverage。
+        """在一次 N prompt forward 中批量计算四分类加权奖励。
 
-        使用 right-padding；先放全部 Support prompt，再放全部 Coverage
-        prompt。空文本为 0，规范化后完全相同的文本为 1，二者均不进入
-        模型 batch。
+        使用 right-padding。空文本为 0，规范化后完全相同的文本为 1，
+        二者均不进入模型 batch。
 
         Args:
             pairs: [(pred_summary, gt_summary), ...]
         Returns:
-            [float, ...]: 每对的 support × coverage 分数。
+            [float, ...]: 每对的四分类概率加权分数。
 
         Raises:
             Exception: 模型加载或推理失败时原样抛出，由调用方中断训练。
@@ -538,7 +501,7 @@ class RewardModel:
     def score_summaries_detailed(
         self, pairs: List[Tuple[str, str]]
     ) -> List[SummaryScore]:
-        """批量计算总分，并返回双向 A/B/C 概率供诊断。
+        """批量计算总分，并返回 A/B/C/D 概率供诊断。
 
         生产调用仍使用 :meth:`score_summaries` 的 ``List[float]`` 接口；
         本方法不会多做一次 forward。
@@ -546,10 +509,10 @@ class RewardModel:
         if not pairs:
             return []
 
-        no_match = (0.0, 0.0, 1.0)
-        exact_match = (1.0, 0.0, 0.0)
+        no_match = (0.0, 0.0, 0.0, 1.0)
+        exact_match = (1.0, 0.0, 0.0, 0.0)
         results = [
-            SummaryScore(0.0, 0.0, 0.0, no_match, no_match, 1.0, 1.0)
+            SummaryScore(0.0, no_match, 1.0)
             for _ in pairs
         ]
         pending = []
@@ -568,7 +531,7 @@ class RewardModel:
                 continue
             if normalized_pred == normalized_gt:
                 results[index] = SummaryScore(
-                    1.0, 1.0, 1.0, exact_match, exact_match, 1.0, 1.0
+                    1.0, exact_match, 1.0
                 )
                 continue
             pending.append((index, pred_summary, gt_summary))
@@ -586,15 +549,9 @@ class RewardModel:
             )
             for index, pred_summary, gt_summary in pending
         ]
-        support_prompts = [
-            self._build_prompt(pred, gt, "support")
-            for _, pred, gt in prepared
+        judgments = [
+            self._build_prompt(pred, gt) for _, pred, gt in prepared
         ]
-        coverage_prompts = [
-            self._build_prompt(pred, gt, "coverage")
-            for _, pred, gt in prepared
-        ]
-        judgments = support_prompts + coverage_prompts
         probabilities, choice_masses = self._infer_choice_probabilities(
             [judgment.text for judgment in judgments]
         )
@@ -609,33 +566,19 @@ class RewardModel:
                 f"expected {len(judgments)}, got {len(choice_masses)}"
             )
 
-        count = len(prepared)
         for offset, (index, _, _) in enumerate(prepared):
-            support_probabilities = tuple(
+            class_probabilities = tuple(
                 float(value) for value in probabilities[offset]
             )
-            coverage_probabilities = tuple(
-                float(value) for value in probabilities[count + offset]
+            score = self._weighted_score(
+                list(class_probabilities), judgments[offset].letter_scores
             )
-            support = self._weighted_score(
-                list(support_probabilities),
-                support_prompts[offset].letter_scores,
-            )
-            coverage = self._weighted_score(
-                list(coverage_probabilities),
-                coverage_prompts[offset].letter_scores,
-            )
-            score = support * coverage
             if not math.isfinite(score) or not 0.0 <= score <= 1.0:
-                raise ValueError(f"R4 combined score is invalid: {score!r}")
+                raise ValueError(f"R4 score is invalid: {score!r}")
             results[index] = SummaryScore(
                 score=score,
-                support_score=support,
-                coverage_score=coverage,
-                support_probabilities=support_probabilities,
-                coverage_probabilities=coverage_probabilities,
-                support_choice_mass=choice_masses[offset],
-                coverage_choice_mass=choice_masses[count + offset],
+                probabilities=class_probabilities,
+                choice_mass=choice_masses[offset],
             )
         return results
 
@@ -662,7 +605,7 @@ def score_summary(pred_summary: str, gt_summary: str) -> float:
     """便捷接口: 校验单条 summary 一致性。
 
     Returns:
-        float ∈ [0, 1]: support × coverage。
+        float ∈ [0, 1]: 四分类概率加权分数。
     """
     return get_reward_model().score_summary(pred_summary, gt_summary)
 
@@ -677,43 +620,43 @@ if __name__ == "__main__":
     import time
 
     logging.basicConfig(level=logging.INFO)
-    print("=== R4 Support × Coverage 双向打分诊断 ===")
+    print("=== R4 summary 语义四分类打分诊断 ===")
 
     diagnostic_pairs = [
         (
             "The woman is left of the man.",
             "The man is right of the woman.",
-            "等价逆关系",
+            "等价逆关系（预期 A）",
         ),
         (
             "The woman moved left.",
             "The woman moved left. The chair disappeared.",
-            "只覆盖一个真值事实",
+            "只覆盖一个真值事实（预期 B）",
         ),
         (
             "The woman moved left. The chair disappeared.",
             "The woman moved left.",
-            "正确事实外另有错报",
+            "正确事实外另有错报（预期 C）",
         ),
         (
             "The woman moved right.",
             "The woman moved left.",
-            "方向冲突",
+            "方向冲突（预期 D）",
         ),
         (
             "The blue-shirted man moved left.",
             "The red-shirted woman moved left.",
-            "实体冲突",
+            "实体冲突（预期 D）",
         ),
         (
             "A chair appeared.",
             "A chair is missing.",
-            "出现与缺失冲突",
+            "出现与缺失冲突（预期 D）",
         ),
         (
             "It is uncertain whether the images differ.",
             "The two images are spatially consistent.",
-            "不确定与一致冲突",
+            "不确定与一致冲突（预期 D）",
         ),
     ]
 
@@ -723,18 +666,10 @@ if __name__ == "__main__":
     )
     elapsed = time.time() - started_at
     for (_, _, description), result in zip(diagnostic_pairs, diagnostic_results):
-        support_probs = "/".join(
-            f"{value:.3f}" for value in result.support_probabilities
-        )
-        coverage_probs = "/".join(
-            f"{value:.3f}" for value in result.coverage_probabilities
-        )
+        class_probs = "/".join(f"{value:.3f}" for value in result.probabilities)
         print(
             f"  {description}: {result.score:.4f}\n"
-            f"    Support  A/B/C={support_probs} mass={result.support_choice_mass:.3f} "
-            f"score={result.support_score:.4f}\n"
-            f"    Coverage A/B/C={coverage_probs} mass={result.coverage_choice_mass:.3f} "
-            f"score={result.coverage_score:.4f}"
+            f"    A/B/C/D={class_probs} mass={result.choice_mass:.3f}"
         )
     print(
         f"共 {len(diagnostic_pairs)} 对，耗时 {elapsed:.2f}s "

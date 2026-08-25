@@ -241,9 +241,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
-    # 每对 summary 在模型侧会展开成 Support/Coverage 两个 prompt。
-    # 16 个 HTTP 请求对应 32 条模型输入，避免双向打分后瞬时 batch 翻倍。
-    parser.add_argument("--max-batch-size", type=int, default=16)
+    # 每对 summary 只对应一个四分类 prompt。
+    parser.add_argument("--max-batch-size", type=int, default=32)
     parser.add_argument("--max-wait-ms", type=float, default=20.0)
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
