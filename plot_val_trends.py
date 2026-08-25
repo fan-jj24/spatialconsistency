@@ -1,50 +1,46 @@
 #!/usr/bin/env python3
-"""
-val_generations 指标走势报告（单页 HTML，自包含 SVG 折线图）。
+"""Recompute validation rewards locally and render a self-contained HTML report.
 
-读取 val_generations 目录下的所有 {step}.jsonl，对每个 step:
-  1. 反查源数据集（复用 inspect_val_generations 的索引/匹配逻辑）
-  2. 用训练 reward 模块重算各子项（C / R2 / R3 / R4，不加系数）
-  3. 按 source 聚合均值
+The script reads ``{step}.jsonl`` files dumped by VERL, matches each prompt back
+to the source JSONL/Parquet data, and uses the repository's *current* reward
+logic.  R4 is evaluated directly with a local reward model through vLLM; no
+training-time HTTP reward server is required.
 
-产出 trends.html，包含:
-  - 概览: meta 信息 + 最新 step 各 source 指标汇总表
-  - 每个指标一张折线图（x=step，每个 source 一条线）:
-      reward / C / R2 / R3 / R4 / 样本数 n
-  - 不渲染具体 case（看 case 用 inspect_val_generations.py）
+Example (one RTX 6000 Ada)::
 
-用法:
     python3 plot_val_trends.py \
-        --val_dir /home/deepspeed/model_output/rl1_ckpt/val_generations \
-        --data_root /home/deepspeed/model_output/RL1 \
-        [--reward_module ../verl/json_answer_reward.py] \
-        [--out /path/to/trends.html]
+      --val_dir /data/run/val_generations \
+      --data_root /data/RL1 \
+      --model_path /models/Qwen3.5-9B \
+      --cuda_visible_devices 0 \
+      --out /data/run/val_trends.html
 """
 
 import argparse
+from collections import defaultdict
+from dataclasses import dataclass, field
 import glob
 import html as html_mod
+import importlib.util
 import json
 import math
 import os
+from pathlib import Path
 import re
 import sys
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, SCRIPT_DIR)
-import inspect_val_generations as ivg  # noqa: E402
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_REWARD_MODULE = SCRIPT_DIR / "json_answer_reward.py"
+DEFAULT_REWARD_MODEL_MODULE = SCRIPT_DIR / "reward_model.py"
 
-DEFAULT_REWARD_MODULE = os.path.normpath(
-    os.path.join(SCRIPT_DIR, "..", "verl", "json_answer_reward.py"))
-DATA_ROOT_DEFAULT = "/home/deepspeed/model_output/RL1"
-
-METRICS = ["reward", "C", "R2", "R3", "R4"]
+METRICS = ["reward", "recorded_reward", "C", "R2", "R3", "R4"]
 METRIC_DESC = {
-    "reward": "jsonl 记录的训练 reward（含系数/门控，原样均值）",
+    "reward": "按当前 json_answer_reward.py 公式重算的总奖励",
+    "recorded_reward": "val JSONL 中原始记录的 score（用于对照）",
     "C": "answer 门控正确率（重算，0/1 均值）",
-    "R2": "并集 IoU（重算，不加系数）",
-    "R3": "label 关键词子集召回（重算，不加系数）",
-    "R4": "方向夹角（重算，不加系数；-1=格式门控触发）",
+    "R2": "框区域奖励（bbox 并集 IoU；humanref 为匈牙利匹配 IoU）",
+    "R3": "label 关键词召回 × IoU × 方向系数（-1=格式门控）",
+    "R4": "本地奖励模型计算的 summary 语义一致性",
     "n": "匹配到的验证样本数",
 }
 
@@ -55,9 +51,23 @@ PALETTE = [
     "#475569", "#0d9488",
 ]
 
-# ============================================================
-# 数据收集: 逐 step 读取 + 匹配 + 聚合
-# ============================================================
+# ---------------------------------------------------------------------------
+# Loading and matching source data
+# ---------------------------------------------------------------------------
+
+
+def load_module(path, name):
+    path = Path(path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Python 模块不存在: {path}")
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法加载 Python 模块: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
 
 def discover_steps(val_dir):
     """扫描 val_dir 下所有 {step}.jsonl，返回按 step 升序的文件列表。"""
@@ -72,58 +82,374 @@ def discover_steps(val_dir):
 
 def load_jsonl(path):
     records = []
-    with open(path) as f:
-        for line in f:
+    with open(path, encoding="utf-8") as f:
+        for line_no, line in enumerate(f, 1):
             line = line.strip()
             if line:
-                records.append(json.loads(line))
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"{path}:{line_no} JSON 无效: {exc}") from exc
+                if not isinstance(value, dict):
+                    raise ValueError(f"{path}:{line_no} 必须是 JSON object")
+                records.append(value)
     return records
 
 
-def collect(val_dir, index, verbose=True):
-    """对每个 step 做匹配+聚合。
+def _plain(value):
+    """Convert Arrow/numpy containers to ordinary Python objects."""
+    if hasattr(value, "as_py"):
+        value = value.as_py()
+    if hasattr(value, "tolist") and not isinstance(value, (str, bytes)):
+        value = value.tolist()
+    return value
 
-    返回 (steps, series, meta):
-      steps:  升序 step 列表
-      series: {source: {metric: {step: value}}}
-              metric ∈ METRICS + ["n"]，value 为均值（n 为计数）
-      meta:   {"total_records": N, "unmatched": {step: n},
-               "cat_of_source": {source: cat}}
-    """
+
+def _text_parts(value):
+    value = _plain(value)
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        if isinstance(value.get("text"), str):
+            return [value["text"]]
+        parts = []
+        for key in ("content", "prompt", "messages"):
+            if key in value:
+                parts.extend(_text_parts(value[key]))
+        return parts
+    if isinstance(value, (list, tuple)):
+        parts = []
+        for item in value:
+            parts.extend(_text_parts(item))
+        return parts
+    return []
+
+
+_TEMPLATE_TOKEN_RE = re.compile(
+    r"<\|(?:im|vision)_(?:start|end)\|>|<\|image_pad\|>"
+    r"|<\|(?:eot_id|endoftext|end)\|>|<\|(?:assistant|user|system)\|>"
+    r"|<image>|\[image\]|\s+",
+    re.IGNORECASE,
+)
+
+
+def prompt_key(value):
+    """Canonical text key shared by source prompts and decoded VERL inputs."""
+    text = "\n".join(_text_parts(value)).strip().lower()
+    # skip_special_tokens=True removes chat boundary tokens but commonly leaves
+    # the role names as standalone lines in the decoded validation input.
+    text = re.sub(r"(?m)^\s*(?:system|user|assistant)\s*$", "", text)
+    text = re.sub(
+        r"<\|im_start\|>\s*(?:system|user|assistant)?", "", text,
+        flags=re.IGNORECASE,
+    )
+    return _TEMPLATE_TOKEN_RE.sub("", text)
+
+
+def _ground_truth(row):
+    for key in ("gts", "ground_truth", "gt"):
+        if row.get(key) is not None:
+            return _plain(row[key])
+    reward_model = _plain(row.get("reward_model"))
+    if isinstance(reward_model, dict):
+        return _plain(reward_model.get("ground_truth"))
+    return None
+
+
+def _as_reward_string(value):
+    value = _plain(value)
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _iter_source_rows(data_root):
+    root = Path(data_root).expanduser().resolve()
+    if not root.exists():
+        raise FileNotFoundError(f"数据地址不存在: {root}")
+    files = ([root] if root.is_file() else sorted(root.rglob("*.jsonl"))
+             + sorted(root.rglob("*.parquet")))
+    if not files:
+        raise FileNotFoundError(f"{root} 下未找到 .jsonl 或 .parquet")
+    for path in files:
+        if path.suffix.lower() == ".jsonl":
+            rows = load_jsonl(path)
+        elif path.suffix.lower() == ".parquet":
+            try:
+                import pyarrow.parquet as pq
+            except ImportError as exc:
+                raise RuntimeError("读取 Parquet 需要安装 pyarrow") from exc
+            rows = pq.read_table(path).to_pylist()
+        else:
+            continue
+        fallback_source = path.parent.name if path.parent != root else path.stem
+        for row in rows:
+            if isinstance(row, dict):
+                yield row, fallback_source, path
+
+
+@dataclass(frozen=True)
+class SourceEntry:
+    key: str
+    data_source: str
+    source: str
+    ground_truth: str
+    path: str
+
+
+class SourceIndex:
+    def __init__(self, entries):
+        self.by_key = defaultdict(list)
+        for entry in entries:
+            self.by_key[entry.key].append(entry)
+        self.keys_by_length = sorted(self.by_key, key=len, reverse=True)
+        self.cache = {}
+
+    def match(self, record):
+        explicit = record.get("data_source")
+        if isinstance(explicit, str) and explicit:
+            source = record.get("source") or explicit
+            return SourceEntry("", explicit, str(source),
+                               _as_reward_string(_ground_truth(record)), "<val>")
+
+        key = prompt_key(record.get("input", record.get("prompt", "")))
+        gt = _as_reward_string(_ground_truth(record))
+        cache_key = (key, gt)
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+
+        candidates = list(self.by_key.get(key, ()))
+        if not candidates and key:
+            # A decoded chat-template input normally contains the original source
+            # prompt plus role markers.  Longest match is the least ambiguous.
+            for source_key in self.keys_by_length:
+                if len(source_key) >= 24 and source_key in key:
+                    candidates.extend(self.by_key[source_key])
+                    break
+        if gt and len(candidates) > 1:
+            same_gt = [item for item in candidates if item.ground_truth == gt]
+            if same_gt:
+                candidates = same_gt
+        # The same validation row may occur in several source shards.  It is
+        # unambiguous when all duplicates resolve to the same source/category.
+        identities = {(item.data_source, item.source, item.ground_truth)
+                      for item in candidates}
+        result = candidates[0] if len(identities) == 1 else None
+        self.cache[cache_key] = result
+        return result
+
+
+def build_index(data_root):
+    entries = []
+    skipped = 0
+    for row, fallback_source, path in _iter_source_rows(data_root):
+        key = prompt_key(row.get("prompt", row.get("input", row.get("messages", ""))))
+        data_source = row.get("data_source")
+        if not key or not isinstance(data_source, str) or not data_source:
+            skipped += 1
+            continue
+        source = row.get("source") or data_source or fallback_source
+        entries.append(SourceEntry(
+            key, data_source, str(source), _as_reward_string(_ground_truth(row)), str(path)
+        ))
+    if not entries:
+        raise RuntimeError(
+            "源数据中没有可索引的 prompt + data_source 记录"
+        )
+    print(f"  索引条目: {len(entries)}，跳过: {skipped}")
+    return SourceIndex(entries)
+
+
+# ---------------------------------------------------------------------------
+# Current reward decomposition and batched local R4 inference
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Case:
+    step: int
+    source: str
+    data_source: str
+    output: str
+    ground_truth: str
+    recorded_reward: float | None
+    metrics: dict = field(default_factory=dict)
+    r4_pair: tuple | None = None
+
+
+def _finite_float(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def decompose_case(case, reward):
+    ds = case.data_source
+    output = case.output
+    gt = case.ground_truth
+    pred_obj = reward._parse_json_obj(output)
+    gt_obj = reward._parse_json_obj(gt)
+
+    if ds in reward.JSON_ANSWER_SOURCES:
+        c = reward.score_json_answer(output, gt)
+        case.metrics.update(C=c, reward=c)
+        return
+    if ds in reward.HUNGARIAN_IOU_SOURCES:
+        r2 = reward.score_hungarian_iou(output, gt)
+        case.metrics.update(R2=r2, reward=r2)
+        return
+
+    gt_entries = reward._parse_bbox_entries(gt)
+    pred_entries = reward._parse_bbox_entries(output)
+    matches = reward._hungarian_match(gt_entries, pred_entries)
+
+    if ds in reward.SPATIAL_CONSISTENCY_BBOX_SOURCES:
+        gt_answer = reward._normalize_answer(
+            gt_obj.get("answer") if isinstance(gt_obj, dict) else None)
+        pred_answer = reward._normalize_answer(
+            pred_obj.get("answer") if isinstance(pred_obj, dict) else None)
+        c = float(gt_answer is not None and pred_answer is not None
+                  and gt_answer == pred_answer)
+        case.metrics["C"] = c
+        if c == 0.0:
+            case.metrics["reward"] = 0.0
+            return
+        if not gt_entries:  # Positive branch never calls R4 in training.
+            case.metrics["reward"] = 1.0 if not pred_entries else 0.2
+            return
+        case.metrics["R2"] = reward._score_r2(gt_entries, pred_entries)
+        case.metrics["R3"] = reward._score_r3(gt_entries, pred_entries, matches)
+    elif ds in reward.SPATIAL_DETECTION_SOURCES:
+        case.metrics["R2"] = reward._score_r2(gt_entries, pred_entries)
+        case.metrics["R3"] = reward._score_r3(gt_entries, pred_entries, matches)
+    else:
+        raise ValueError(f"未知 data_source: {ds!r}")
+
+    if not isinstance(pred_obj, dict) or not isinstance(gt_obj, dict):
+        case.metrics["R4"] = 0.0
+        return
+    pred_summary = pred_obj.get("summary")
+    gt_summary = gt_obj.get("summary")
+    if not isinstance(pred_summary, str) or not isinstance(gt_summary, str):
+        case.metrics["R4"] = 0.0
+    elif not pred_summary.strip() or not gt_summary.strip():
+        case.metrics["R4"] = 0.0
+    else:
+        case.r4_pair = (pred_summary, gt_summary)
+
+
+def score_r4_locally(cases, reward_model, reward, batch_size):
+    pair_to_score = {}
+    unique_pairs = []
+    for case in cases:
+        if case.r4_pair is not None and case.r4_pair not in pair_to_score:
+            pair_to_score[case.r4_pair] = None
+            unique_pairs.append(case.r4_pair)
+    if unique_pairs:
+        print(f"本地 R4 推理: {len(unique_pairs)} 个唯一 summary 对")
+    for start in range(0, len(unique_pairs), batch_size):
+        batch = unique_pairs[start:start + batch_size]
+        scores = reward_model.score_summaries(batch)
+        if len(scores) != len(batch):
+            raise RuntimeError("reward_model.score_summaries 返回数量错误")
+        for pair, score in zip(batch, scores):
+            score = float(score)
+            if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+                raise ValueError(f"R4 返回无效分数: {score!r}")
+            pair_to_score[pair] = score
+        print(f"  R4 {min(start + len(batch), len(unique_pairs))}/{len(unique_pairs)}")
+
+    for case in cases:
+        if "R4" not in case.metrics and case.r4_pair is not None:
+            case.metrics["R4"] = pair_to_score[case.r4_pair]
+        if "R4" not in case.metrics:
+            continue
+        if case.data_source in reward.SPATIAL_CONSISTENCY_BBOX_SOURCES:
+            case.metrics["reward"] = case.metrics["C"] * (
+                0.1 + 0.25 * case.metrics["R2"]
+                + 0.25 * case.metrics["R3"] + 0.4 * case.metrics["R4"])
+        elif case.data_source in reward.SPATIAL_DETECTION_SOURCES:
+            case.metrics["reward"] = (
+                0.25 * case.metrics["R2"] + 0.25 * case.metrics["R3"]
+                + 0.5 * case.metrics["R4"])
+
+
+def collect(val_dir, index, reward, local_model, batch_size, verbose=True):
     step_files = discover_steps(val_dir)
     if not step_files:
         raise SystemExit(f"ERROR: {val_dir} 下没有找到 {{step}}.jsonl 文件")
 
-    steps = []
-    series = {}
-    cat_of_source = {}
+    cases = []
     unmatched = {}
     total_records = 0
-
-    for step, f in step_files:
-        records = load_jsonl(f)
+    for step, path in step_files:
+        records = load_jsonl(path)
         total_records += len(records)
-        matched, mstats = ivg.match_records(records, index)
-        unmatched[step] = mstats["unmatched"]
-        groups = ivg.aggregate(matched)  # 同时完成子项分解
-
-        steps.append(step)
-        for src, g in groups.items():
-            cat_of_source.setdefault(src, g["cat"])
-            s = series.setdefault(src, {})
-            for m in METRICS:
-                acc = g[m]
-                if acc.n > 0:
-                    s.setdefault(m, {})[step] = acc.mean
-            s.setdefault("n", {})[step] = g["n"]
-
+        step_unmatched = 0
+        for record in records:
+            source_entry = index.match(record)
+            if source_entry is None:
+                step_unmatched += 1
+                continue
+            gt = _as_reward_string(_ground_truth(record)) or source_entry.ground_truth
+            output = record.get("output", record.get("response", ""))
+            case = Case(
+                step=step,
+                source=source_entry.source,
+                data_source=source_entry.data_source,
+                output=str(output or ""),
+                ground_truth=gt,
+                recorded_reward=_finite_float(record.get("score", record.get("reward"))),
+            )
+            decompose_case(case, reward)
+            cases.append(case)
+        unmatched[step] = step_unmatched
         if verbose:
-            print(f"  step {step}: {len(records)} 条, 匹配 {len(matched)}, "
-                  f"未匹配 {mstats['unmatched']}, sources={len(groups)}")
+            print(f"  step {step}: {len(records)} 条, "
+                  f"匹配 {len(records) - step_unmatched}, 未匹配 {step_unmatched}")
 
-    meta = {"total_records": total_records, "unmatched": unmatched,
-            "cat_of_source": cat_of_source}
-    return steps, series, meta
+    if not cases:
+        raise RuntimeError(
+            "没有匹配到任何验证样本；请检查 --data_root 是否对应"
+            "生成这些 val JSONL 的源数据"
+        )
+
+    score_r4_locally(cases, local_model, reward, batch_size)
+
+    sums = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
+    counts = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+    ns = defaultdict(lambda: defaultdict(int))
+    categories = {}
+    for case in cases:
+        categories.setdefault(case.source, case.data_source)
+        ns[case.source][case.step] += 1
+        values = dict(case.metrics)
+        if case.recorded_reward is not None:
+            values["recorded_reward"] = case.recorded_reward
+        for metric, value in values.items():
+            sums[case.source][metric][case.step] += value
+            counts[case.source][metric][case.step] += 1
+
+    series = {}
+    for source, metrics in sums.items():
+        series[source] = {}
+        for metric, by_step in metrics.items():
+            series[source][metric] = {
+                step: total / counts[source][metric][step]
+                for step, total in by_step.items()
+            }
+        series[source]["n"] = dict(ns[source])
+
+    meta = {
+        "total_records": total_records,
+        "unmatched": unmatched,
+        "cat_of_source": categories,
+    }
+    return [step for step, _ in step_files], series, meta
 
 # ============================================================
 # SVG 折线图（自包含，无 JS/CDN 依赖）
@@ -302,7 +628,8 @@ def build_summary_table(steps, series, sources, colors, cat_of_source):
             f"<tbody>{''.join(rows)}</tbody></table>")
 
 
-def build_html(steps, series, meta, val_dir, reward_module, out_path):
+def build_html(steps, series, meta, val_dir, data_root, reward_module,
+               model_path, out_path):
     cat_of_source = meta["cat_of_source"]
     # source 按类别 + 名字排序，颜色稳定分配
     sources = sorted(series.keys(),
@@ -317,7 +644,9 @@ def build_html(steps, series, meta, val_dir, reward_module, out_path):
     meta_html = f"""
     <div class='meta-grid'>
       <div><span class='k'>val 目录</span><br><b>{html_mod.escape(val_dir)}</b></div>
+      <div><span class='k'>源数据</span><br><b>{html_mod.escape(data_root)}</b></div>
       <div><span class='k'>reward 模块</span><br><b>{html_mod.escape(reward_module)}</b></div>
+      <div><span class='k'>R4 本地模型</span><br><b>{html_mod.escape(model_path)}</b></div>
       <div><span class='k'>step 数</span><br><b>{len(steps)}</b>
         （{steps[0]} → {steps[-1]}）</div>
       <div><span class='k'>source 数</span><br><b>{len(sources)}</b></div>
@@ -342,7 +671,7 @@ def build_html(steps, series, meta, val_dir, reward_module, out_path):
 </head>
 <body>
 <h1>val_generations 指标走势</h1>
-<div class='sub'>各指标按 source 的逐步走势（不加系数的重算均值；reward 列为 jsonl 原值）</div>
+<div class='sub'>各指标按 source 的逐步走势；reward 按当前公式重算，recorded_reward 为 JSONL 原值</div>
 
 <div class='card'>
   <h2>概览</h2>
@@ -374,37 +703,81 @@ def build_html(steps, series, meta, val_dir, reward_module, out_path):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="val_generations 指标走势报告（单页 HTML，SVG 折线图）")
-    ap.add_argument("--val_dir", required=True,
+        description="用本地 R4 模型重算 val_generations 奖励并绘图")
+    ap.add_argument("--val_dir", "--val-dir", required=True,
                     help="val_generations 目录（含 {step}.jsonl）")
-    ap.add_argument("--data_root", default=DATA_ROOT_DEFAULT,
-                    help="训练数据根目录（用于反查 source）")
-    ap.add_argument("--reward_module", default=DEFAULT_REWARD_MODULE,
+    ap.add_argument("--data_root", "--data-root", required=True,
+                    help="源数据目录/文件（递归读取 JSONL 和 Parquet）")
+    ap.add_argument("--model_path", "--model-path", required=True,
+                    help="本地 R4 奖励模型目录")
+    ap.add_argument("--reward_module", "--reward-module",
+                    default=str(DEFAULT_REWARD_MODULE),
                     help="训练用 json_answer_reward.py 路径（保证子项口径一致）")
+    ap.add_argument("--reward_model_module", "--reward-model-module",
+                    default=str(DEFAULT_REWARD_MODEL_MODULE),
+                    help="本地 reward_model.py 路径")
+    ap.add_argument("--cuda_visible_devices", "--cuda-visible-devices",
+                    default=os.environ.get("CUDA_VISIBLE_DEVICES", "0"),
+                    help="用于 R4 的 GPU，RTX 6000 Ada 单卡通常填 0")
+    ap.add_argument("--batch_size", "--batch-size", type=int, default=32,
+                    help="R4 推理批大小（默认 32）")
+    ap.add_argument("--gpu_memory_utilization", "--gpu-memory-utilization",
+                    type=float, default=0.8,
+                    help="vLLM 单卡显存使用比例（默认 0.8）")
+    ap.add_argument("--kv_cache_memory_bytes", "--kv-cache-memory-bytes",
+                    type=int, default=0,
+                    help="显式 KV cache 字节数；0 表示由 vLLM 自动分配")
     ap.add_argument("--out", default=None,
                     help="输出 HTML 路径（默认: val_dir/trends.html）")
     args = ap.parse_args()
 
+    if args.batch_size <= 0:
+        ap.error("--batch_size 必须为正整数")
+    if not 0.0 < args.gpu_memory_utilization <= 1.0:
+        ap.error("--gpu_memory_utilization 必须在 (0, 1] 内")
+    if args.kv_cache_memory_bytes < 0:
+        ap.error("--kv_cache_memory_bytes 不能为负数")
+
+    val_dir = str(Path(args.val_dir).expanduser().resolve())
+    data_root = str(Path(args.data_root).expanduser().resolve())
+    model_path = str(Path(args.model_path).expanduser().resolve())
+    if not Path(val_dir).is_dir():
+        ap.error(f"val 目录不存在: {val_dir}")
+    if not Path(model_path).is_dir():
+        ap.error(f"奖励模型目录不存在: {model_path}")
     if args.out is None:
-        args.out = os.path.join(args.val_dir, "trends.html")
+        args.out = os.path.join(val_dir, "trends.html")
+    out_path = str(Path(args.out).expanduser().resolve())
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
 
-    # 1. 加载 reward 模块（inspect_val_generations 的全局 R）
-    ivg.R = ivg.load_reward_module(args.reward_module)
-    print(f"reward 模块: {args.reward_module}")
+    # reward_model.py reads these settings at import time.  TP=1 targets the
+    # local RTX 6000 Ada; the training server's TP=8 defaults must not leak in.
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
+    os.environ["R4_MODEL_LOCAL_PATH"] = model_path
+    os.environ["R4_VLLM_TENSOR_PARALLEL_SIZE"] = "1"
+    os.environ["R4_VLLM_GPU_MEMORY_UTILIZATION"] = str(args.gpu_memory_utilization)
+    os.environ["R4_VLLM_KV_CACHE_BYTES"] = str(args.kv_cache_memory_bytes)
+    os.environ["R4_VLLM_MAX_NUM_SEQS"] = str(args.batch_size)
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
-    # 2. 建索引（只做一次，所有 step 共用）
+    reward = load_module(args.reward_module, "_plot_json_answer_reward")
+    reward_model_module = load_module(
+        args.reward_model_module, "_plot_local_reward_model")
+    local_model = reward_model_module.RewardModel()
+    print(f"reward 模块: {Path(args.reward_module).resolve()}")
+    print(f"R4 本地模型: {model_path} (GPU {args.cuda_visible_devices}, TP=1)")
+
     print("建立源数据索引（只读 prompt + reward_model 列）...")
-    index = ivg.build_index(args.data_root)
-    print(f"  索引条目: {len(index)}")
+    index = build_index(data_root)
 
-    # 3. 逐 step 收集
-    print(f"扫描 {args.val_dir} ...")
-    steps, series, meta = collect(args.val_dir, index)
+    print(f"扫描 {val_dir} ...")
+    steps, series, meta = collect(
+        val_dir, index, reward, local_model, args.batch_size)
     print(f"共 {len(steps)} 个 step: {steps}")
 
-    # 4. 生成 HTML
-    out_path = build_html(steps, series, meta, args.val_dir,
-                          args.reward_module, args.out)
+    out_path = build_html(
+        steps, series, meta, val_dir, data_root,
+        str(Path(args.reward_module).resolve()), model_path, out_path)
     print(f"\n完成。报告: {out_path}")
 
 
