@@ -62,6 +62,7 @@ import logging
 import math
 import os
 import threading
+import time
 from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -128,6 +129,218 @@ class SummaryScore:
     score: float
     probabilities: Tuple[float, float, float, float]
     choice_mass: float
+
+
+@dataclass(frozen=True)
+class GpuMemoryPeaks:
+    """一次诊断区间内由设备驱动观测到的整卡显存峰值。"""
+
+    device_labels: Tuple[str, ...]
+    per_device_bytes: Tuple[int, ...]
+    simultaneous_total_bytes: int
+
+
+class GpuMemoryMonitor:
+    """低开销采样整卡已用显存，包含独立的 vLLM TP worker。
+
+    NVIDIA 环境优先使用 NVML，不创建额外 CUDA context；PPU 等 CUDA
+    兼容环境若没有 NVML，则回退到 ``torch.cuda.mem_get_info``。后者读取
+    驱动报告的整卡 free/total，并非只统计当前 Python 进程的 allocator。
+    """
+
+    def __init__(self, device_count: int, sample_interval_seconds: float = 0.1):
+        if device_count <= 0:
+            raise ValueError("GPU memory monitor device_count must be positive")
+        if sample_interval_seconds <= 0.0:
+            raise ValueError("GPU memory sample interval must be positive")
+        self._device_count = device_count
+        self._sample_interval_seconds = sample_interval_seconds
+        self._nvml = None
+        self._torch = None
+        self._handles = []
+        self._device_indices = []
+        self._device_labels = []
+        self._overall_per_device = []
+        self._overall_total = 0
+        self._interval_per_device = []
+        self._interval_total = 0
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._sampling_error = None
+
+    @staticmethod
+    def _visible_device_selectors(nvml) -> List[str]:
+        visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if visible_devices is not None:
+            return [
+                item.strip()
+                for item in visible_devices.split(",")
+                if item.strip() and item.strip() != "-1"
+            ]
+        return [str(index) for index in range(nvml.nvmlDeviceGetCount())]
+
+    def _resolve_devices(self) -> None:
+        selectors = self._visible_device_selectors(self._nvml)
+        if len(selectors) < self._device_count:
+            raise RuntimeError(
+                "GPU memory monitor found only "
+                f"{len(selectors)} visible device(s), expected at least "
+                f"{self._device_count}"
+            )
+
+        for logical_index, selector in enumerate(selectors[: self._device_count]):
+            if selector.isdecimal():
+                self._handles.append(
+                    self._nvml.nvmlDeviceGetHandleByIndex(int(selector))
+                )
+                self._device_labels.append(f"GPU{selector}")
+            else:
+                self._handles.append(
+                    self._nvml.nvmlDeviceGetHandleByUUID(selector)
+                )
+                # UUID/MIG UUID 很长，输出中使用 vLLM 看到的逻辑卡号。
+                self._device_labels.append(f"GPU{logical_index}")
+
+    def _use_torch_cuda_provider(self, nvml_error: BaseException) -> None:
+        logger.info(
+            "NVML GPU memory query unavailable (%s); falling back to "
+            "torch.cuda.mem_get_info",
+            nvml_error,
+        )
+        import torch
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is unavailable for GPU memory diagnostics")
+        visible_device_count = torch.cuda.device_count()
+        if visible_device_count < self._device_count:
+            raise RuntimeError(
+                "GPU memory monitor found only "
+                f"{visible_device_count} CUDA device(s), expected at least "
+                f"{self._device_count}"
+            )
+        self._torch = torch
+        self._device_indices = list(range(self._device_count))
+        self._device_labels = [
+            f"GPU{device_index}" for device_index in self._device_indices
+        ]
+
+    def _read_used_bytes(self) -> List[int]:
+        if self._nvml is not None:
+            return [
+                int(self._nvml.nvmlDeviceGetMemoryInfo(handle).used)
+                for handle in self._handles
+            ]
+        used_bytes = []
+        for device_index in self._device_indices:
+            free_bytes, total_bytes = self._torch.cuda.mem_get_info(device_index)
+            used_bytes.append(int(total_bytes) - int(free_bytes))
+        return used_bytes
+
+    def _sample(self) -> None:
+        with self._lock:
+            used_bytes = self._read_used_bytes()
+            total_used = sum(used_bytes)
+            self._overall_per_device = [
+                max(previous, current)
+                for previous, current in zip(
+                    self._overall_per_device, used_bytes
+                )
+            ]
+            self._interval_per_device = [
+                max(previous, current)
+                for previous, current in zip(
+                    self._interval_per_device, used_bytes
+                )
+            ]
+            self._overall_total = max(self._overall_total, total_used)
+            self._interval_total = max(self._interval_total, total_used)
+
+    def _run(self) -> None:
+        try:
+            while not self._stop_event.wait(self._sample_interval_seconds):
+                self._sample()
+        except BaseException as exc:
+            self._sampling_error = exc
+            self._stop_event.set()
+
+    def start(self) -> None:
+        if self._thread is not None:
+            raise RuntimeError("GPU memory monitor is already started")
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            self._nvml = pynvml
+            self._resolve_devices()
+        except Exception as nvml_error:
+            if self._nvml is not None:
+                self._nvml.nvmlShutdown()
+            self._nvml = None
+            self._handles = []
+            self._device_labels = []
+            self._use_torch_cuda_provider(nvml_error)
+
+        self._overall_per_device = [0] * self._device_count
+        self._interval_per_device = [0] * self._device_count
+        self._sample()
+
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="r4-gpu-memory-monitor",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def reset_interval(self) -> None:
+        """开始一个 batch 的独立峰值统计，同时保留全程峰值。"""
+        self._raise_if_sampling_failed()
+        with self._lock:
+            current = self._read_used_bytes()
+            self._interval_per_device = current
+            self._interval_total = sum(current)
+            self._overall_per_device = [
+                max(previous, value)
+                for previous, value in zip(self._overall_per_device, current)
+            ]
+            self._overall_total = max(self._overall_total, sum(current))
+
+    def interval_peaks(self) -> GpuMemoryPeaks:
+        self._raise_if_sampling_failed()
+        self._sample()
+        with self._lock:
+            return GpuMemoryPeaks(
+                device_labels=tuple(self._device_labels),
+                per_device_bytes=tuple(self._interval_per_device),
+                simultaneous_total_bytes=self._interval_total,
+            )
+
+    def _raise_if_sampling_failed(self) -> None:
+        if self._sampling_error is not None:
+            raise RuntimeError("GPU memory sampling failed") from self._sampling_error
+
+    def stop(self) -> GpuMemoryPeaks:
+        if self._thread is None:
+            raise RuntimeError("GPU memory monitor is not started")
+        self._stop_event.set()
+        self._thread.join()
+        try:
+            self._raise_if_sampling_failed()
+            self._sample()
+            with self._lock:
+                return GpuMemoryPeaks(
+                    device_labels=tuple(self._device_labels),
+                    per_device_bytes=tuple(self._overall_per_device),
+                    simultaneous_total_bytes=self._overall_total,
+                )
+        finally:
+            if self._nvml is not None:
+                self._nvml.nvmlShutdown()
+            self._thread = None
+
+
+def _bytes_to_gib(value: int) -> float:
+    return value / (1024 ** 3)
 
 
 class RewardModel:
@@ -645,7 +858,6 @@ def score_summaries(pairs: List[Tuple[str, str]]) -> List[float]:
 # ── 本地真实模型诊断 ──
 if __name__ == "__main__":
     from collections import Counter
-    import time
 
     from reward_model_diagnostic_cases import (
         DIAGNOSTIC_BATCH_SIZE,
@@ -741,50 +953,66 @@ if __name__ == "__main__":
     print("\n=== 128 条真实训练风格四分类测试（32 条/batch）===")
     realistic_cases = build_realistic_diagnostic_cases()
     all_case_results = []
+    gpu_memory_monitor = GpuMemoryMonitor(VLLM_TENSOR_PARALLEL_SIZE)
+    gpu_memory_monitor.start()
     total_started_at = time.perf_counter()
-    for batch_start in range(0, len(realistic_cases), DIAGNOSTIC_BATCH_SIZE):
-        batch_number = batch_start // DIAGNOSTIC_BATCH_SIZE + 1
-        batch_cases = realistic_cases[
-            batch_start : batch_start + DIAGNOSTIC_BATCH_SIZE
-        ]
-        if len(batch_cases) != DIAGNOSTIC_BATCH_SIZE:
-            raise RuntimeError(
-                f"Diagnostic batch {batch_number} has {len(batch_cases)} cases, "
-                f"expected {DIAGNOSTIC_BATCH_SIZE}"
-            )
-
-        batch_started_at = time.perf_counter()
-        batch_results = reward_model.score_summaries_detailed(
-            [
-                (case.pred_summary, case.gt_summary)
-                for case in batch_cases
+    try:
+        for batch_start in range(0, len(realistic_cases), DIAGNOSTIC_BATCH_SIZE):
+            batch_number = batch_start // DIAGNOSTIC_BATCH_SIZE + 1
+            batch_cases = realistic_cases[
+                batch_start : batch_start + DIAGNOSTIC_BATCH_SIZE
             ]
-        )
-        batch_elapsed = time.perf_counter() - batch_started_at
-        all_case_results.extend(zip(batch_cases, batch_results))
-
-        batch_predictions = [
-            CHOICE_LETTERS[
-                max(
-                    range(len(CHOICE_LETTERS)),
-                    key=lambda i: result.probabilities[i],
+            if len(batch_cases) != DIAGNOSTIC_BATCH_SIZE:
+                raise RuntimeError(
+                    f"Diagnostic batch {batch_number} has {len(batch_cases)} cases, "
+                    f"expected {DIAGNOSTIC_BATCH_SIZE}"
                 )
-            ]
-            for result in batch_results
-        ]
-        batch_hits = sum(
-            predicted == case.expected_class
-            for case, predicted in zip(batch_cases, batch_predictions)
-        )
-        expected_counts = Counter(case.expected_class for case in batch_cases)
-        print(
-            f"  batch {batch_number}/4: {len(batch_cases)} 条，"
-            f"A/B/C/D={expected_counts['A']}/{expected_counts['B']}/"
-            f"{expected_counts['C']}/{expected_counts['D']}，"
-            f"top-1={batch_hits}/{len(batch_cases)}，耗时 {batch_elapsed:.2f}s"
-        )
 
+            gpu_memory_monitor.reset_interval()
+            batch_started_at = time.perf_counter()
+            batch_results = reward_model.score_summaries_detailed(
+                [
+                    (case.pred_summary, case.gt_summary)
+                    for case in batch_cases
+                ]
+            )
+            batch_elapsed = time.perf_counter() - batch_started_at
+            batch_memory_peaks = gpu_memory_monitor.interval_peaks()
+            all_case_results.extend(zip(batch_cases, batch_results))
+
+            batch_predictions = [
+                CHOICE_LETTERS[
+                    max(
+                        range(len(CHOICE_LETTERS)),
+                        key=lambda i: result.probabilities[i],
+                    )
+                ]
+                for result in batch_results
+            ]
+            batch_hits = sum(
+                predicted == case.expected_class
+                for case, predicted in zip(batch_cases, batch_predictions)
+            )
+            expected_counts = Counter(case.expected_class for case in batch_cases)
+            print(
+                f"  batch {batch_number}/4: {len(batch_cases)} 条，"
+                f"A/B/C/D={expected_counts['A']}/{expected_counts['B']}/"
+                f"{expected_counts['C']}/{expected_counts['D']}，"
+                f"top-1={batch_hits}/{len(batch_cases)}，"
+                f"耗时 {batch_elapsed:.2f}s，"
+                "峰值显存/卡 "
+                f"{_bytes_to_gib(max(batch_memory_peaks.per_device_bytes)):.2f} GiB"
+            )
+    except BaseException:
+        try:
+            gpu_memory_monitor.stop()
+        except BaseException:
+            logger.exception(
+                "Failed to stop GPU memory monitor after diagnostic error"
+            )
+        raise
     total_elapsed = time.perf_counter() - total_started_at
+    total_memory_peaks = gpu_memory_monitor.stop()
     if len(all_case_results) != len(realistic_cases):
         raise RuntimeError(
             "R4 diagnostic returned the wrong result count: "
@@ -859,6 +1087,23 @@ if __name__ == "__main__":
         f"top-1={hits}/{len(realistic_cases)} ({hits / len(realistic_cases):.2%})，"
         f"耗时 {total_elapsed:.2f}s "
         f"({total_elapsed / len(realistic_cases):.3f}s/条)，"
+        "峰值显存/卡 "
+        f"{_bytes_to_gib(max(total_memory_peaks.per_device_bytes)):.2f} GiB，"
         f"对类别目标分数 MAE={sum(absolute_errors) / len(absolute_errors):.4f}"
+    )
+    per_device_memory = "，".join(
+        f"{label}={_bytes_to_gib(used_bytes):.2f} GiB"
+        for label, used_bytes in zip(
+            total_memory_peaks.device_labels,
+            total_memory_peaks.per_device_bytes,
+        )
+    )
+    print(
+        "  各卡峰值（128 条测试期间整卡已用，100ms 采样）: "
+        f"{per_device_memory}"
+    )
+    print(
+        f"  {len(total_memory_peaks.device_labels)} 卡同时总峰值: "
+        f"{_bytes_to_gib(total_memory_peaks.simultaneous_total_bytes):.2f} GiB"
     )
     reward_model.close()
