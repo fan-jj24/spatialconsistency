@@ -42,13 +42,22 @@ R4_SERVER_PYTHON=${R4_SERVER_PYTHON:-python3}
 export R4_MODEL_LOCAL_PATH=${R4_MODEL_LOCAL_PATH:-"/home/deepspeed/model_output/Qwen"}
 R4_SERVER_HOST=${R4_SERVER_HOST:-127.0.0.1}
 R4_SERVER_PORT=${R4_SERVER_PORT:-8765}
-# 一对 summary 对应一条四分类模型输入；整批只执行一次 forward。
-R4_SERVER_MAX_BATCH_SIZE=${R4_SERVER_MAX_BATCH_SIZE:-10}
+# 一对 summary 对应一条四分类模型输入；动态攒 32 条送入 vLLM。
+R4_SERVER_MAX_BATCH_SIZE=${R4_SERVER_MAX_BATCH_SIZE:-32}
 R4_SERVER_MAX_WAIT_MS=${R4_SERVER_MAX_WAIT_MS:-20}
 R4_SERVER_STARTUP_TIMEOUT=${R4_SERVER_STARTUP_TIMEOUT:-600}
 R4_SERVER_LOG=${R4_SERVER_LOG:-"/tmp/spatialconsistency_r4_reward_server.log"}
 export R4_REWARD_URL=${R4_REWARD_URL:-"http://${R4_SERVER_HOST}:${R4_SERVER_PORT}"}
 export R4_REWARD_TIMEOUT_SECONDS=${R4_REWARD_TIMEOUT_SECONDS:-300}
+# 奖励模型与 VERL 共用 8 张卡。1 GiB/卡的显式 KV cache 避免 vLLM
+# 按比例预留大量无用 cache；eager 模式在 reward_model.py 中固定开启。
+R4_CUDA_VISIBLE_DEVICES=${R4_CUDA_VISIBLE_DEVICES:-"0,1,2,3,4,5,6,7"}
+export R4_VLLM_TENSOR_PARALLEL_SIZE=${R4_VLLM_TENSOR_PARALLEL_SIZE:-8}
+export R4_VLLM_KV_CACHE_BYTES=${R4_VLLM_KV_CACHE_BYTES:-1073741824}
+export R4_VLLM_GPU_MEMORY_UTILIZATION=${R4_VLLM_GPU_MEMORY_UTILIZATION:-0.08}
+export R4_VLLM_MAX_NUM_SEQS=${R4_VLLM_MAX_NUM_SEQS:-${R4_SERVER_MAX_BATCH_SIZE}}
+export R4_VLLM_LOGPROBS=${R4_VLLM_LOGPROBS:-128}
+R4_VLLM_WORKER_MULTIPROC_METHOD=${R4_VLLM_WORKER_MULTIPROC_METHOD:-spawn}
 
 # 11 个数据集目录
 DATASET_NAMES=(
@@ -138,7 +147,7 @@ ENTROPY_COEFF=${ENTROPY_COEFF:-0.0}
 INFER_BACKEND=${INFER_BACKEND:-vllm}
 ROLLOUT_TP=${ROLLOUT_TP:-2}
 # 0.75 时 checkpoint 保存 OOM，降到 0.7 腾出 ~4.8 GiB
-ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.75}
+ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.70}
 ULYSSES_SP=${ULYSSES_SP:-1}
 
 # ---- 日志 & checkpoint ----
@@ -186,7 +195,8 @@ echo "  模型:           ${MODEL_PATH}"
 echo "  数据根目录:     ${DATA_ROOT}"
 echo "  Reward:         ${REWARD_FILE}"
 echo "  R4 service:     ${R4_REWARD_URL} (batch=${R4_SERVER_MAX_BATCH_SIZE}, wait=${R4_SERVER_MAX_WAIT_MS}ms)"
-echo "  R4 model:       ${R4_MODEL_LOCAL_PATH} (Qwen3.5-9B, CPU BF16)"
+echo "  R4 model:       ${R4_MODEL_LOCAL_PATH} (Qwen3.5-9B, vLLM BF16 TP=${R4_VLLM_TENSOR_PARALLEL_SIZE})"
+echo "  R4 GPUs:        ${R4_CUDA_VISIBLE_DEVICES} (KV cache=${R4_VLLM_KV_CACHE_BYTES} bytes/GPU)"
 echo "  Epochs:         ${TOTAL_EPOCHS} (ppo_epochs=1, 样本不重复迭代)"
 echo "  LR:             ${ACTOR_LR} (warmup steps=${ACTOR_LR_WARMUP_STEPS})"
 echo "  Batch:          train=${TRAIN_BATCH_SIZE}, mini=${PPO_MINI_BATCH_SIZE}, rollout_n=${ROLLOUT_N}"
@@ -210,6 +220,12 @@ fi
 
 if [ ! -d "${R4_MODEL_LOCAL_PATH}" ]; then
     echo "ERROR: R4 模型目录不存在: ${R4_MODEL_LOCAL_PATH}"
+    exit 1
+fi
+
+IFS=',' read -r -a R4_GPU_IDS <<< "${R4_CUDA_VISIBLE_DEVICES}"
+if [ "${#R4_GPU_IDS[@]}" -lt "${R4_VLLM_TENSOR_PARALLEL_SIZE}" ]; then
+    echo "ERROR: R4_CUDA_VISIBLE_DEVICES 只有 ${#R4_GPU_IDS[@]} 张卡，少于 TP=${R4_VLLM_TENSOR_PARALLEL_SIZE}"
     exit 1
 fi
 
@@ -388,6 +404,8 @@ TRAINER=(
 # 启动中央 R4 动态批处理服务
 # ------------------------------------------------------------
 echo "启动 R4 reward service，日志: ${R4_SERVER_LOG}"
+CUDA_VISIBLE_DEVICES="${R4_CUDA_VISIBLE_DEVICES}" \
+VLLM_WORKER_MULTIPROC_METHOD="${R4_VLLM_WORKER_MULTIPROC_METHOD}" \
 "${R4_SERVER_PYTHON}" "${R4_SERVER_FILE}" \
     --host "${R4_SERVER_HOST}" \
     --port "${R4_SERVER_PORT}" \

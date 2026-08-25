@@ -241,8 +241,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
-    # 每对 summary 对应一个四分类 prompt；10 对即一次 forward 10 条。
-    parser.add_argument("--max-batch-size", type=int, default=10)
+    # 每对 summary 对应一个四分类 prompt；默认一次送入 vLLM 32 条。
+    parser.add_argument("--max-batch-size", type=int, default=32)
     parser.add_argument("--max-wait-ms", type=float, default=20.0)
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
@@ -284,9 +284,10 @@ def run_server(args) -> int:
     signal.signal(signal.SIGTERM, handle_signal)
 
     batcher = None
+    model = None
     try:
         LOGGER.info("Loading R4 reward model before accepting score requests")
-        # 延迟导入，确保模块导入和 DynamicBatcher 单元测试不要求 torch。
+        # 延迟导入，确保模块导入和 DynamicBatcher 单元测试不要求 vLLM。
         # 正式服务启动时导入/加载失败仍会立即非零退出。
         from reward_model import get_reward_model
 
@@ -320,6 +321,9 @@ def run_server(args) -> int:
     finally:
         if batcher is not None:
             batcher.close()
+        if model is not None:
+            LOGGER.info("Shutting down R4 vLLM engine")
+            model.close()
         server.server_close()
         server_thread.join(timeout=5)
 
