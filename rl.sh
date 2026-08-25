@@ -39,9 +39,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REWARD_FILE=${REWARD_FILE:-"${SCRIPT_DIR}/json_answer_reward.py"}
 R4_SERVER_FILE=${R4_SERVER_FILE:-"${SCRIPT_DIR}/reward_model_server.py"}
 R4_SERVER_PYTHON=${R4_SERVER_PYTHON:-python3}
+export R4_MODEL_LOCAL_PATH=${R4_MODEL_LOCAL_PATH:-"/home/deepspeed/model_output/Qwen"}
 R4_SERVER_HOST=${R4_SERVER_HOST:-127.0.0.1}
 R4_SERVER_PORT=${R4_SERVER_PORT:-8765}
-# 一对 summary 对应三条二分类模型输入；10 对即一次 forward 最多 30 条。
+# 一对 summary 对应一条四分类模型输入；整批只执行一次 forward。
 R4_SERVER_MAX_BATCH_SIZE=${R4_SERVER_MAX_BATCH_SIZE:-10}
 R4_SERVER_MAX_WAIT_MS=${R4_SERVER_MAX_WAIT_MS:-20}
 R4_SERVER_STARTUP_TIMEOUT=${R4_SERVER_STARTUP_TIMEOUT:-600}
@@ -185,6 +186,7 @@ echo "  模型:           ${MODEL_PATH}"
 echo "  数据根目录:     ${DATA_ROOT}"
 echo "  Reward:         ${REWARD_FILE}"
 echo "  R4 service:     ${R4_REWARD_URL} (batch=${R4_SERVER_MAX_BATCH_SIZE}, wait=${R4_SERVER_MAX_WAIT_MS}ms)"
+echo "  R4 model:       ${R4_MODEL_LOCAL_PATH} (Qwen3.5-9B, CPU BF16)"
 echo "  Epochs:         ${TOTAL_EPOCHS} (ppo_epochs=1, 样本不重复迭代)"
 echo "  LR:             ${ACTOR_LR} (warmup steps=${ACTOR_LR_WARMUP_STEPS})"
 echo "  Batch:          train=${TRAIN_BATCH_SIZE}, mini=${PPO_MINI_BATCH_SIZE}, rollout_n=${ROLLOUT_N}"
@@ -203,6 +205,11 @@ fi
 
 if [ ! -f "${R4_SERVER_FILE}" ]; then
     echo "ERROR: R4 reward service 不存在: ${R4_SERVER_FILE}"
+    exit 1
+fi
+
+if [ ! -d "${R4_MODEL_LOCAL_PATH}" ]; then
+    echo "ERROR: R4 模型目录不存在: ${R4_MODEL_LOCAL_PATH}"
     exit 1
 fi
 

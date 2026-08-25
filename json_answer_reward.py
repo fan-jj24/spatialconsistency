@@ -87,8 +87,8 @@ JSON RLVR Reward Function（分类奖励框架）
       三值 (x,y,z): 方向本身 → 取前两维 (x,y)
 
 ━━━ R4 子项详解（第三、四类共用）━━━
-  R4（summary 一致性校验，Qwen3.5-0.8B 奖励模型）:
-    使用 Qwen/Qwen3.5-0.8B（0.8B VLM）作为判官，运行在 CPU 上，
+  R4（summary 一致性校验，Qwen3.5-9B 奖励模型）:
+    使用 Qwen/Qwen3.5-9B 作为判官，运行在 CPU 上，
     校验模型输出的 summary 与 GT summary 是否语义一致。
     模型加载和推理封装在中央 reward_model_server.py 服务中，本文件通过
     同目录 reward_model_client.py 发起单条 HTTP 请求，由服务动态攒批。
@@ -96,7 +96,7 @@ JSON RLVR Reward Function（分类奖励框架）
     调用: reward_model_client.score_summary(pred_summary, gt_summary)
     返回: 单次四分类概率的加权分数，范围 [0, 1]。模型直接判断候选为
     完全符合、部分符合（仅遗漏）、部分不符合（有正确内容也有错误）、
-    完全不符合；对应权重为 1、0.5、0.25、0，由中央服务中的 0.8B
+    完全不符合；对应权重为 1、0.5、0.25、0，由中央服务中的 9B
     模型批量判断。
     性能: CPU bfloat16，由中央服务动态合批
 
@@ -703,11 +703,11 @@ def _extract_direction_vec(label, bbox):
 
 
 # ============================================================
-# R4: summary 一致性校验 (Qwen3.5-0.8B 奖励模型)
+# R4: summary 一致性校验 (Qwen3.5-9B 奖励模型)
 # ============================================================
 
 def _score_r4(pred_obj, gt_obj):
-    """R4: 用 Qwen3.5-0.8B 校验 pred summary 与 GT summary 是否语义一致。
+    """R4: 用 Qwen3.5-9B 校验 pred summary 与 GT summary 是否语义一致。
 
     输入为调用方已经解析的 JSON 对象。预测 JSON/summary 无效属于普通坏
     样本，R4 记 0；客户端、网络、模型加载和推理异常则直接向上抛出。
@@ -762,7 +762,7 @@ def score_spatial_consistency_bbox(solution_str, ground_truth):
       R = C × (0.15 + 0.65×R2 + 0.1×R3 + 0.1×R4)
 
     R3 已融入 IoU 缩放和方向系数（原方向 R4）。
-    R4 为 summary 一致性校验（Qwen3.5-0.8B 奖励模型）。
+    R4 为 summary 一致性校验（Qwen3.5-9B 奖励模型）。
     """
     # C: answer 门控
     gt_obj = _parse_json_obj(ground_truth)
@@ -801,7 +801,7 @@ def score_spatial_detection(solution_str, ground_truth):
     GT 结构同第三类，但无 C 门控、无正例空框分支。
 
     R3 已融入 IoU 缩放和方向系数（原方向 R4）。
-    R4 为 summary 一致性校验（Qwen3.5-0.8B 奖励模型）。
+    R4 为 summary 一致性校验（Qwen3.5-9B 奖励模型）。
     """
     gt_obj = _parse_json_obj(ground_truth)
     pred_obj = _parse_json_obj(solution_str)

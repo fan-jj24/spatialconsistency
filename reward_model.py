@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""R4 奖励模型: Qwen3.5-0.8B summary 单次四分类判断。
+"""R4 奖励模型: Qwen3.5-9B summary 单次四分类判断。
 
 在 verl RLVR 奖励框架中，R4 负责校验模型输出的 summary 与 GT summary
-是否语义一致。使用 Qwen/Qwen3.5-0.8B（0.8B VLM）作为判官模型，
+是否语义一致。使用 Qwen/Qwen3.5-9B 作为判官模型，
 运行在 CPU 上（bfloat16）。
 
 设计:
@@ -74,13 +74,13 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 
 # ── 模型配置 ──
-MODEL_NAME = os.environ.get("R4_MODEL_NAME", "Qwen/Qwen3.5-0.8B")
+MODEL_NAME = os.environ.get("R4_MODEL_NAME", "Qwen/Qwen3.5-9B")
 # 本地模型路径: 设为 None 则从 ModelScope 自动下载到默认缓存目录；
-# 设为本地路径（如 "E:/models/Qwen3.5-0.8B"）则直接从本地加载，跳过下载。
+# 设为本地路径则直接从本地加载，跳过下载。
 MODEL_LOCAL_PATH = os.environ.get(
-    "R4_MODEL_LOCAL_PATH", "/home/deepspeed/model_output/Qwen3.5-0.8B"
+    "R4_MODEL_LOCAL_PATH", "/home/deepspeed/model_output/Qwen"
 ) or None
-# CPU 推理: bfloat16（0.8B 模型 ~1.6GB）
+# CPU 推理: bfloat16（9B 权重约 18GB），不占用训练 GPU。
 TORCH_DTYPE = "bfloat16"
 DEVICE = "cpu"
 
@@ -128,7 +128,7 @@ class SummaryScore:
 
 
 class RewardModel:
-    """Qwen3.5-0.8B 奖励模型封装。
+    """Qwen3.5-9B 奖励模型封装。
 
     线程安全: _load_lock 保护加载，_infer_lock 保护推理。
     """
@@ -159,7 +159,9 @@ class RewardModel:
         with self._load_lock:
             if self._loaded:  # double-check
                 return
-            logger.info("Loading Qwen3.5-0.8B reward model on CPU...")
+            logger.info(
+                "Loading %s reward model on %s...", MODEL_NAME, DEVICE
+            )
             try:
                 # ── 禁用 fla / causal_conv1d，强制纯 PyTorch ──
                 # Qwen3.5 的 Gated DeltaNet 架构依赖 fla 和 causal_conv1d
