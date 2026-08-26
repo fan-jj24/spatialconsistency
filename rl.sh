@@ -117,14 +117,13 @@ import pyarrow.parquet as pq
 
 data_dir = Path(sys.argv[1])
 output = Path(sys.argv[2])
-train_files = sorted(data_dir.glob("train_*.parquet"))
-if not train_files:
-    raise FileNotFoundError(f"{data_dir} 下没有 train_*.parquet")
+train_file = data_dir / "train_0000.parquet"
+if not train_file.is_file():
+    raise FileNotFoundError(f"{data_dir} 下没有 train_0000.parquet")
 
-tables = [pq.read_table(path) for path in train_files]
-table = tables[0] if len(tables) == 1 else pa.concat_tables(tables)
+table = pq.read_table(train_file)
 if table.num_rows == 0:
-    raise ValueError(f"{data_dir} 下的训练 Parquet 为空")
+    raise ValueError(f"{train_file} 为空")
 
 count = min(200, table.num_rows)
 indices = sorted(random.Random(42).sample(range(table.num_rows), count))
@@ -133,7 +132,7 @@ sampled = table.take(pa.array(indices, type=pa.int64()))
 temporary = output.with_suffix(output.suffix + ".tmp")
 pq.write_table(sampled, temporary)
 os.replace(temporary, output)
-print(f"  [INFO] 已从 {len(train_files)} 个训练文件复制 {count}/{table.num_rows} 条 -> {output}")
+print(f"  [INFO] 已从 {train_file.name} 复制 {count}/{table.num_rows} 条 -> {output}")
 PY
         else
             echo "  [INFO] 复用已有附加验证集: ${extra_val}"
