@@ -3,8 +3,9 @@
 
 The script reads ``{step}.jsonl`` files dumped by VERL, matches each prompt back
 to the source JSONL/Parquet data, and uses the repository's *current* reward
-logic.  R4 is evaluated directly with a local reward model through vLLM; no
-training-time HTTP reward server is required.
+logic.  R4 is evaluated directly with a local reward model through vLLM when
+available, with a Transformers fallback for Windows and environments without
+vLLM; no training-time HTTP reward server is required.
 
 Example (one RTX 6000 Ada)::
 
@@ -358,6 +359,251 @@ def decompose_case(case, reward):
         case.r4_pair = (pred_summary, gt_summary)
 
 
+class TransformersRewardModel:
+    """Transformers adapter matching reward_model.RewardModel's batch API.
+
+    The training reward server keeps its vLLM-only tensor-parallel behavior;
+    this offline script can additionally run natively on Windows. Prompt and
+    scoring constants come from reward_model.py to keep both paths aligned.
+    """
+
+    def __init__(self, reward_model_module, model_path, device="auto"):
+        self._config = reward_model_module
+        self._model_path = model_path
+        self._requested_device = device
+        self._torch = None
+        self._tokenizer = None
+        self._model = None
+        self._device = None
+        self._choice_token_ids = None
+
+    @staticmethod
+    def _normalize_summary(summary):
+        return " ".join(summary.split()).casefold()
+
+    def _ensure_loaded(self):
+        if self._model is not None:
+            return
+        try:
+            import torch
+            from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+        except ImportError as exc:
+            raise RuntimeError(
+                "Transformers 回退后端需要安装 torch 和 transformers"
+            ) from exc
+
+        if self._requested_device == "auto":
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
+        else:
+            device = self._requested_device
+        if device.startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError("指定了 Transformers CUDA 后端，但 torch 未检测到 CUDA")
+
+        print(f"加载 Transformers R4 模型到 {device}: {self._model_path}")
+        tokenizer = AutoTokenizer.from_pretrained(
+            self._model_path, trust_remote_code=True,
+        )
+        tokenizer.padding_side = "left"
+        if tokenizer.pad_token_id is None:
+            if tokenizer.eos_token_id is None:
+                raise RuntimeError("奖励模型 tokenizer 没有 pad_token 或 eos_token")
+            tokenizer.pad_token = tokenizer.eos_token
+
+        model_config = AutoConfig.from_pretrained(
+            self._model_path, trust_remote_code=True,
+        )
+        if getattr(model_config, "vision_config", None) is not None:
+            try:
+                from transformers import AutoModelForMultimodalLM
+            except ImportError as exc:
+                raise RuntimeError(
+                    "当前模型是完整多模态 Qwen3.5 检查点；请升级 transformers "
+                    "以获得 AutoModelForMultimodalLM"
+                ) from exc
+            model_loader = AutoModelForMultimodalLM
+        else:
+            model_loader = AutoModelForCausalLM
+        model = model_loader.from_pretrained(
+            self._model_path,
+            trust_remote_code=True,
+            torch_dtype="auto",
+        )
+        model.to(device)
+        model.eval()
+
+        choice_token_ids = []
+        for letter in self._config.CHOICE_LETTERS:
+            token_ids = tokenizer.encode(letter, add_special_tokens=False)
+            if len(token_ids) != 1:
+                raise RuntimeError(
+                    f"选项 {letter!r} 不是单个 tokenizer token: {token_ids!r}"
+                )
+            token_id = token_ids[0]
+            decoded = tokenizer.decode(
+                [token_id],
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+            if decoded != letter:
+                raise RuntimeError(
+                    f"选项 token {token_id} 解码为 {decoded!r}，而不是 {letter!r}"
+                )
+            choice_token_ids.append(token_id)
+        if len(set(choice_token_ids)) != len(choice_token_ids):
+            raise RuntimeError(f"A/B/C/D token 不唯一: {choice_token_ids!r}")
+
+        self._torch = torch
+        self._tokenizer = tokenizer
+        self._model = model
+        self._device = device
+        self._choice_token_ids = choice_token_ids
+
+    def _truncate_summary(self, summary):
+        token_ids = self._tokenizer.encode(
+            summary,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=self._config.MAX_SUMMARY_TOKENS,
+        )
+        return self._tokenizer.decode(token_ids, skip_special_tokens=True)
+
+    def _build_prompt(self, pred_summary, gt_summary):
+        messages = [
+            {"role": "system", "content": self._config.SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": self._config.INPUT_TEMPLATE.format(
+                    gt=gt_summary, pred=pred_summary,
+                ),
+            },
+        ]
+        return self._tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+
+    def _infer_scores(self, prompts):
+        encoded = self._tokenizer(
+            prompts,
+            padding=True,
+            add_special_tokens=False,
+            return_tensors="pt",
+        )
+        lengths = encoded["attention_mask"].sum(dim=1).tolist()
+        for index, length in enumerate(lengths):
+            if length > self._config.MAX_INPUT_TOKENS:
+                raise RuntimeError(
+                    f"R4 prompt {index} 截断后仍有 {length} tokens，超过 "
+                    f"R4_MAX_INPUT_TOKENS={self._config.MAX_INPUT_TOKENS}；"
+                    "请减小 R4_MAX_SUMMARY_TOKENS"
+                )
+        encoded = {key: value.to(self._device) for key, value in encoded.items()}
+        with self._torch.inference_mode():
+            generated = self._model.generate(
+                **encoded,
+                max_new_tokens=1,
+                do_sample=False,
+                use_cache=True,
+                return_dict_in_generate=True,
+                output_logits=True,
+                pad_token_id=self._tokenizer.pad_token_id,
+            )
+        if not generated.logits or len(generated.logits) != 1:
+            raise RuntimeError("Transformers R4 未返回一个 token 的原始 logits")
+        next_token_logits = generated.logits[0].float()
+        choice_logits = next_token_logits[:, self._choice_token_ids]
+        choice_probabilities = self._torch.softmax(choice_logits, dim=-1)
+
+        # Same fail-closed check as the vLLM implementation: the four choices
+        # must carry enough probability mass in the complete vocabulary.
+        log_normalizer = self._torch.logsumexp(next_token_logits, dim=-1)
+        choice_log_mass = self._torch.logsumexp(choice_logits, dim=-1) - log_normalizer
+        choice_masses = choice_log_mass.exp().detach().cpu().tolist()
+        for index, mass in enumerate(choice_masses):
+            if not math.isfinite(mass) or mass < self._config.MIN_CHOICE_MASS:
+                raise RuntimeError(
+                    f"R4 prompt {index} 的 A/B/C/D 总概率 {mass:.6g} 低于 "
+                    f"R4_MIN_CHOICE_MASS={self._config.MIN_CHOICE_MASS:.6g}"
+                )
+
+        weights = self._torch.tensor(
+            self._config.CHOICE_WEIGHTS,
+            dtype=choice_probabilities.dtype,
+            device=choice_probabilities.device,
+        )
+        return (choice_probabilities * weights).sum(dim=-1).detach().cpu().tolist()
+
+    def score_summaries(self, pairs):
+        if not pairs:
+            return []
+        results = [0.0] * len(pairs)
+        pending = []
+        for index, pair in enumerate(pairs):
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                raise TypeError(f"pairs[{index}] 必须是 (pred_summary, gt_summary)")
+            pred_summary, gt_summary = pair
+            if not isinstance(pred_summary, str) or not isinstance(gt_summary, str):
+                raise TypeError(f"pairs[{index}] 的 summary 必须都是字符串")
+            normalized_pred = self._normalize_summary(pred_summary)
+            normalized_gt = self._normalize_summary(gt_summary)
+            if not normalized_pred or not normalized_gt:
+                continue
+            if normalized_pred == normalized_gt:
+                results[index] = 1.0
+                continue
+            pending.append((index, pred_summary, gt_summary))
+
+        if not pending:
+            return results
+        self._ensure_loaded()
+        prompts = [
+            self._build_prompt(
+                self._truncate_summary(pred_summary),
+                self._truncate_summary(gt_summary),
+            )
+            for _, pred_summary, gt_summary in pending
+        ]
+        scores = self._infer_scores(prompts)
+        if len(scores) != len(pending):
+            raise RuntimeError("Transformers R4 返回数量错误")
+        for (index, _, _), score in zip(pending, scores):
+            results[index] = float(score)
+        return results
+
+
+def create_local_reward_model(reward_model_module, model_path, backend, device):
+    """Select vLLM when usable, otherwise return the Transformers adapter."""
+    selected = backend
+    vllm_error = None
+    if selected == "auto":
+        if sys.platform == "win32":
+            selected = "transformers"
+        else:
+            try:
+                import vllm  # noqa: F401 - verify importability, not presence
+            except (ImportError, OSError, RuntimeError) as exc:
+                vllm_error = exc
+                selected = "transformers"
+            else:
+                selected = "vllm"
+    if selected == "vllm":
+        return reward_model_module.RewardModel(), selected
+    if vllm_error is not None:
+        print(f"vLLM 不可用（{vllm_error}），自动回退到 Transformers")
+    elif backend == "auto" and sys.platform == "win32":
+        print("检测到 Windows，自动使用 Transformers R4 后端")
+    return TransformersRewardModel(
+        reward_model_module, model_path, device=device,
+    ), selected
+
+
 def score_r4_locally(cases, reward_model, reward, batch_size):
     pair_to_score = {}
     unique_pairs = []
@@ -645,7 +891,7 @@ def build_summary_table(steps, series, sources, colors, cat_of_source):
 
 
 def build_html(steps, series, meta, val_dir, data_root, reward_module,
-               model_path, out_path):
+               model_path, r4_backend, out_path):
     cat_of_source = meta["cat_of_source"]
     # source 按类别 + 名字排序，颜色稳定分配
     sources = sorted(series.keys(),
@@ -663,6 +909,7 @@ def build_html(steps, series, meta, val_dir, data_root, reward_module,
       <div><span class='k'>源数据</span><br><b>{html_mod.escape(data_root)}</b></div>
       <div><span class='k'>reward 模块</span><br><b>{html_mod.escape(reward_module)}</b></div>
       <div><span class='k'>R4 本地模型</span><br><b>{html_mod.escape(model_path)}</b></div>
+      <div><span class='k'>R4 推理后端</span><br><b>{html_mod.escape(r4_backend)}</b></div>
       <div><span class='k'>step 数</span><br><b>{len(steps)}</b>
         （{steps[0]} → {steps[-1]}）</div>
       <div><span class='k'>source 数</span><br><b>{len(sources)}</b></div>
@@ -737,6 +984,12 @@ def main():
                     help="用于 R4 的 GPU，RTX 6000 Ada 单卡通常填 0")
     ap.add_argument("--batch_size", "--batch-size", type=int, default=32,
                     help="R4 推理批大小（默认 32）")
+    ap.add_argument("--r4_backend", "--r4-backend",
+                    choices=("auto", "vllm", "transformers"), default="auto",
+                    help="R4 后端；auto 优先 vLLM，不可用时回退 Transformers")
+    ap.add_argument("--transformers_device", "--transformers-device",
+                    default="auto",
+                    help="Transformers 设备，如 auto、cuda、cuda:0 或 cpu")
     ap.add_argument("--gpu_memory_utilization", "--gpu-memory-utilization",
                     type=float, default=0.8,
                     help="vLLM 单卡显存使用比例（默认 0.8）")
@@ -779,9 +1032,19 @@ def main():
     reward = load_module(args.reward_module, "_plot_json_answer_reward")
     reward_model_module = load_module(
         args.reward_model_module, "_plot_local_reward_model")
-    local_model = reward_model_module.RewardModel()
+    local_model, r4_backend = create_local_reward_model(
+        reward_model_module,
+        model_path,
+        args.r4_backend,
+        args.transformers_device,
+    )
     print(f"reward 模块: {Path(args.reward_module).resolve()}")
-    print(f"R4 本地模型: {model_path} (GPU {args.cuda_visible_devices}, TP=1)")
+    if r4_backend == "vllm":
+        print(f"R4 本地模型: {model_path} (vLLM, GPU "
+              f"{args.cuda_visible_devices}, TP=1)")
+    else:
+        print(f"R4 本地模型: {model_path} (Transformers, device="
+              f"{args.transformers_device})")
 
     print("建立源数据索引（只读 prompt + reward_model 列）...")
     index = build_index(data_root)
@@ -793,7 +1056,7 @@ def main():
 
     out_path = build_html(
         steps, series, meta, val_dir, data_root,
-        str(Path(args.reward_module).resolve()), model_path, out_path)
+        str(Path(args.reward_module).resolve()), model_path, r4_backend, out_path)
     print(f"\n完成。报告: {out_path}")
 
 
