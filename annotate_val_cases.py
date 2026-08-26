@@ -746,7 +746,7 @@ function render() {
     `<div class="image-wrap"><div class="image-label">第 ${i+1} 幅图${i===1 ? ' · GT 与预测框叠加' : ''}</div>`+
     `<img src="${src}" alt="case ${c.order} image ${i+1}"></div>`).join('') : '';
   $('case').innerHTML = `
-    <div class="meta"><b class="mono">JSONL #${c.jsonl_line}</b><span>${escapeHtml(c.source)}</span>`+
+    <div class="meta"><b class="mono">${escapeHtml(REPORT.row_label)} #${c.jsonl_line}</b><span>${escapeHtml(c.source)}</span>`+
     `<span>${escapeHtml(c.source_file)} row ${c.source_row}</span></div>
     ${c.image_error ? `<div class="error">${escapeHtml(c.image_error)}</div>` : ''}
     <div class="images">${imageHtml || '<div class="empty">无可用图片</div>'}</div>
@@ -806,7 +806,7 @@ function exportJsonl() {
   }));
   const blob = new Blob([lines.join('\n')+'\n'], {type:'application/x-ndjson;charset=utf-8'});
   const url = URL.createObjectURL(blob), a = document.createElement('a');
-  a.href=url; a.download=`annotations_step_${REPORT.step}.jsonl`; a.click();
+  a.href=url; a.download=REPORT.export_filename; a.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 async function importJsonl(file) {
@@ -856,18 +856,38 @@ def _safe_script_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
 
 
-def build_html(cases: list[Case], val_jsonl: Path, step: str, out_path: Path) -> None:
+def build_html(
+    cases: list[Case],
+    val_jsonl: Path,
+    step: str,
+    out_path: Path,
+    *,
+    title: str | None = None,
+    sources: Iterable[str] | None = None,
+    subtitle: str = "",
+    row_label: str = "JSONL",
+    export_filename: str | None = None,
+) -> None:
+    """Build the shared interactive annotation page.
+
+    Keyword-only options allow reward-free rollout reports to reuse this UI.
+    Existing IVG-style callers retain the original defaults.
+    """
     digest = hashlib.sha256()
     for case in cases:
         digest.update(case.case_id.encode())
         digest.update(case.ground_truth.encode())
         digest.update(case.prediction.encode())
+    report_sources = list(sources) if sources is not None else list(TARGET_SOURCES)
+    page_title = title or f"Step {step} 人工正确率标注"
     report = {
         "id": digest.hexdigest()[:20],
         "step": step,
         "val_jsonl": str(val_jsonl),
-        "sources": list(TARGET_SOURCES),
+        "sources": report_sources,
         "count": len(cases),
+        "row_label": row_label,
+        "export_filename": export_filename or f"annotations_step_{step}.jsonl",
     }
     payload = [{
         "id": case.case_id,
@@ -884,9 +904,10 @@ def build_html(cases: list[Case], val_jsonl: Path, step: str, out_path: Path) ->
     document = f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Step {html_mod.escape(step)} 人工正确率标注</title><style>{CSS}</style></head>
+<title>{html_mod.escape(page_title)}</title><style>{CSS}</style></head>
 <body><header class="top"><div class="top-inner">
-  <div class="title-row"><h1>Step {html_mod.escape(step)} 人工正确率标注</h1>
+  <div class="title-row"><h1>{html_mod.escape(page_title)}</h1>
+    {f'<span class="muted">{html_mod.escape(subtitle)}</span>' if subtitle else ''}
     <span class="grow"></span><span id="count" class="mono"></span></div>
   <div id="stats" class="stats"></div>
   <div class="controls">
