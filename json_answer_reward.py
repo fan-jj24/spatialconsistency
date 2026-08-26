@@ -75,8 +75,9 @@ JSON RLVR Reward Function（分类奖励框架）
 
     方向系数 dir_coef（原 R4 融入，仅在 move 同时 ∈ gt_kw 且 ∈ pred_kw 时生效）:
       GT label 有箭头向量:
-        dir_coef = cosθ（同向=1, 垂直=0, 反向=-1；零向量=0）
-        GT 3 值 + pred 2 值 → dir_coef -= 0.2（丢失深度，无条件扣）
+        同维度: dir_coef = cosθ（2 值算2D，3 值算3D）
+        不同维度: 比较共同的 XY 投影，再对称扣 0.1
+        同向=1, 垂直=0, 反向=-1；零向量的余弦记0；结果 clamp 到 [-1,1]
       GT label 有 move 但无箭头:
         dir_coef = 1.0（GT 没要求方向，pred 有 move 且格式合规即可）
       否则: dir_coef = 1.0（该对不涉及 move，不缩放）
@@ -84,7 +85,7 @@ JSON RLVR Reward Function（分类奖励框架）
     方向向量提取:
       二值 (x,y): 位置 → 方向 = (x-cx, cy-y)
                   cx,cy = 该框各自中心; 第一维正=右, 第二维正=上
-      三值 (x,y,z): 方向本身 → 取前两维 (x,y)
+      三值 (x,y,z): 完整三维方向向量
 
 ━━━ R4 子项详解（第三、四类共用）━━━
   R4（summary 一致性校验，Qwen3.5-9B 奖励模型）:
@@ -628,17 +629,22 @@ def _score_r3(gt_entries, pred_entries, matches):
                     # GT 给了箭头时，零向量没有方向，不能保留默认满分。
                     dir_coef = 0.0
                     if pred_vec is not None:
-                        norm = np.linalg.norm(gt_vec) * np.linalg.norm(pred_vec)
+                        if gt_ndim == pred_ndim:
+                            gt_cmp, pred_cmp = gt_vec, pred_vec
+                        else:
+                            # 2/3 值不同维度时，只比较共同的 XY 投影。
+                            gt_cmp, pred_cmp = gt_vec[:2], pred_vec[:2]
+                        norm = np.linalg.norm(gt_cmp) * np.linalg.norm(pred_cmp)
                         if np.isfinite(norm) and norm >= 1e-12:
-                            cos_theta = np.dot(gt_vec, pred_vec) / norm
+                            cos_theta = np.dot(gt_cmp, pred_cmp) / norm
                             if np.isfinite(cos_theta):
                                 dir_coef = max(
                                     -1.0, min(1.0, float(cos_theta))
                                 )
-                    # GT 三值、pred 二值时无条件扣 0.2，
-                    # 包括其中一个是零向量的情况。
-                    if gt_ndim == 3 and pred_ndim == 2:
-                        dir_coef -= 0.2
+                        # 维度不匹配时双向对称扣分；即使 XY 投影
+                        # 是零向量，也保留这一维度惩罚。
+                        if gt_ndim != pred_ndim:
+                            dir_coef = max(-1.0, dir_coef - 0.1)
                 # GT 有 move 但无箭头 → dir_coef 保持 1.0。
                 # pred 有 move 但无合法箭头 → 已被格式门控拦截。
                 label_points += dir_coef - 1.0
@@ -678,13 +684,13 @@ def _count_bracket_vectors(label):
 
 
 def _extract_direction_vec(label, bbox):
-    """从 label 文本中提取括号内的数值向量，转成 2D 方向。
+    """从 label 文本中提取括号内的数值向量。
 
     两种格式:
       二值 (x, y): 位置 → 方向 = (x - cx, cy - y)
                    cx,cy = bbox 中心; 第一维正=右, 第二维正=上
-      三值 (x, y, z): 方向本身 → 取前两维 (x, y)
-    返回 ((dx, dy), n_dims)，n_dims ∈ {2, 3}；无法提取返回 (None, 0)。
+      三值 (x, y, z): 完整三维方向向量
+    返回 (direction, n_dims)，n_dims ∈ {2, 3}；无法提取返回 (None, 0)。
     """
     vectors = _extract_bracket_vectors(label)
     if not vectors:
@@ -698,7 +704,7 @@ def _extract_direction_vec(label, bbox):
         dy = cy - y  # 图像 y 向下，取反使正=上
         return (dx, dy), 2
     elif len(nums) == 3:
-        return (nums[0], nums[1]), 3
+        return (nums[0], nums[1], nums[2]), 3
     return None, 0
 
 
@@ -968,6 +974,10 @@ if __name__ == "__main__":
     # 负例 GT: move 无箭头 → pred 有 move 即可, dir_coef=1
     gt_neg_noarrow = ('{"answer": "B", "summary": "inconsistent", '
                       '"boxes": [{"bbox": [0,0,100,100], "label": "move"}]}')
+    gt_neg_3d = ('{"answer": "B", "summary": "inconsistent", '
+                 '"boxes": [{"bbox": [0,0,100,100], "label": "move (1, 0, 1)"}]}')
+    gt_neg_depth = ('{"answer": "B", "summary": "inconsistent", '
+                    '"boxes": [{"bbox": [0,0,100,100], "label": "move (0, 0, 1)"}]}')
     SCB_POS = "spatial_consistency_bbox_pos"
     SCB_NEG = "spatial_consistency_bbox_neg"
     cases_3 = [
@@ -978,6 +988,19 @@ if __name__ == "__main__":
         # 负例完美匹配: R2=1, R3=1, R4=1 → R = 0.1+0.25+0.25+0.4 = 1.0
         (SCB_NEG, scb_think + '{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move (100, 50)"}]}',
          gt_neg, 1.0, "负例完美匹配=1.0"),
+        # 3D 同维度使用完整 xyz: (1,0,1)·(1,0,-1)=0 → dir=0。
+        (SCB_NEG, scb_think + '{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move (1, 0, -1)"}]}',
+         gt_neg_3d, 0.75, "3D夹角使用完整xyz"),
+        # GT 3D、pred 2D: XY 同向后对称扣 0.1 → dir=0.9。
+        (SCB_NEG, scb_think + '{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move (100, 50)"}]}',
+         ('{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move (1, 0, 0)"}]}'),
+         0.975, "GT3D-pred2D对称扣0.1"),
+        # GT 2D、pred 3D 也扣 0.1，不再鼓励固定输出 3 值。
+        (SCB_NEG, scb_think + '{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move (1, 0, 0)"}]}',
+         gt_neg, 0.975, "GT2D-pred3D对称扣0.1"),
+        # 纯深度向量的 XY 投影为零：余弦记0，仍扣维度惩罚。
+        (SCB_NEG, scb_think + '{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move (100, 50)"}]}',
+         gt_neg_depth, 0.725, "纯深度与2D比较dir=-0.1"),
         # 负例部分重叠: R2=1/7, R3: dir=0 → R3=0, R4=1
         #   R = 0.1 + 0.25/7 + 0 + 0.4 = 0.5357
         (SCB_NEG, scb_think + '{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [50,50,150,150], "label": "move (100, 50)"}]}',
