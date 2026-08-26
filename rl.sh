@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
 # ============================================================
-# RL1 全量验证 + 训练集抽样评测脚本 — verl 0.8.0 DAPO recipe
+# RL1 正式训练脚本 — verl 0.8.0 DAPO recipe
 #
 # 权重: /home/deepspeed/model_output/Qwen_SFT
 # 数据: /home/deepspeed/model_output/RL1 (5 个数据集目录)
-# 评测: 全部 val_*.parquet + 每个数据集目录的 train_*.parquet
-#       固定随机抽样 200 条，只跑 VERL 原生训练前验证
+# 训练: 5 epoch, LR=5e-7, warmup 10 步, ppo_epochs=1
 #
 # 关键配置:
-#   - trainer.val_only=True: 训练前验证结束后立即退出
-#   - trainer.total_epochs=0: 显式表明不进行训练
-#   - train 抽样只用于验证，不会从原 Parquet 中删除数据
+#   - ppo_epochs=1: 每个 rollout batch 只做一次策略更新，
+#     一个样本在一个 epoch 内只被迭代一次
 #   - gpu_memory_utilization=0.7: 给 checkpoint 保存留出显存
 #     (0.75 时初始保存 OOM: 需要 7.74 GiB, 只剩 7.37 GiB;
 #      0.7 可多腾出 ~4.8 GiB, 预计够用; 若仍 OOM 降到 0.65)
@@ -20,54 +18,11 @@
 #     (依赖已打过的 patch_freeze_vision_sft.py 补丁)
 #
 # 用法:
-#   bash rl.sh
-#   bash rl.sh --train-eval-samples-per-dataset 200 --train-eval-seed 42
-#   FREEZE_VISION=1 bash rl.sh
+#   bash rl.sh                        # 全参数训练
+#   FREEZE_VISION=1 bash rl.sh        # 冻结 vision（推荐）
 # ============================================================
 
 set -euo pipefail
-
-# rl.sh 自身的评测参数；其余参数原样透传给 Hydra。
-TRAIN_EVAL_SAMPLES_PER_DATASET=${TRAIN_EVAL_SAMPLES_PER_DATASET:-200}
-TRAIN_EVAL_SEED=${TRAIN_EVAL_SEED:-42}
-HYDRA_ARGS=()
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        --train-eval-samples-per-dataset)
-            if [ "$#" -lt 2 ]; then
-                echo "ERROR: --train-eval-samples-per-dataset 需要一个非负整数"
-                exit 2
-            fi
-            TRAIN_EVAL_SAMPLES_PER_DATASET=$2
-            shift 2
-            ;;
-        --train-eval-seed)
-            if [ "$#" -lt 2 ]; then
-                echo "ERROR: --train-eval-seed 需要一个整数"
-                exit 2
-            fi
-            TRAIN_EVAL_SEED=$2
-            shift 2
-            ;;
-        --help|-h)
-            echo "Usage: bash rl.sh [--train-eval-samples-per-dataset N] [--train-eval-seed SEED] [Hydra overrides...]"
-            exit 0
-            ;;
-        *)
-            HYDRA_ARGS+=("$1")
-            shift
-            ;;
-    esac
-done
-
-if ! [[ "${TRAIN_EVAL_SAMPLES_PER_DATASET}" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: TRAIN_EVAL_SAMPLES_PER_DATASET 必须是非负整数"
-    exit 2
-fi
-if ! [[ "${TRAIN_EVAL_SEED}" =~ ^-?[0-9]+$ ]]; then
-    echo "ERROR: TRAIN_EVAL_SEED 必须是整数"
-    exit 2
-fi
 
 # ------------------------------------------------------------
 # 路径
@@ -131,9 +86,10 @@ for name in "${DATASET_NAMES[@]}"; do
     done
 done
 
-# 没有 val 时仍可只评测后面生成的 train 抽样；不回退到全量 train。
+# 如果没有独立的 val 文件，回退到用 train 文件做验证
 if [ -z "${VAL_FILES}" ]; then
-    echo "  [WARN] 未找到 val_*.parquet，将只评测 train 抽样"
+    echo "  [WARN] 未找到 val_*.parquet，回退到用 train 文件做验证"
+    VAL_FILES="${TRAIN_FILES}"
 fi
 
 # ---- 训练规模 ----
@@ -142,9 +98,8 @@ NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-128}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-32}
 ROLLOUT_N=${ROLLOUT_N:-8}
-# 只跑训练前验证，不执行任何训练 epoch。
-TOTAL_EPOCHS=${TOTAL_EPOCHS:-0}
-VAL_ONLY=${VAL_ONLY:-True}
+# 2 epoch; ppo_epochs=1 保证每个样本每 epoch 只迭代一次
+TOTAL_EPOCHS=${TOTAL_EPOCHS:-5}
 
 # ---- 动态 batching ----
 USE_DYNAMIC_BSZ=${USE_DYNAMIC_BSZ:-false}
@@ -193,11 +148,10 @@ ULYSSES_SP=${ULYSSES_SP:-1}
 # ---- 日志 & checkpoint ----
 PROJECT_NAME=${PROJECT_NAME:-"spatialscore_dapo_080"}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-"qwen3_5_9b_rl1"}
-# 评测不保存 checkpoint。
-SAVE_FREQ=${SAVE_FREQ:--1}
+# 约 100 个优化步，每 25 步保存一次 → 约 4 个 ckpt，只保留最新 2 个
+SAVE_FREQ=${SAVE_FREQ:-30}
 CKPT_DIR=${CKPT_DIR:-"/home/deepspeed/model_output/rl1_ckpt"}
-# 默认严格评测 MODEL_PATH，避免 auto 意外加载 CKPT_DIR 中的旧训练检查点。
-RESUME_MODE=${RESUME_MODE:-disable}
+RESUME_MODE=${RESUME_MODE:-auto}
 
 export WANDB_MODE=${WANDB_MODE:-"online"}
 export WANDB_PROJECT=${WANDB_PROJECT:-"${PROJECT_NAME}"}
@@ -227,79 +181,10 @@ export NUMEXPR_NUM_THREADS=${NUMEXPR_NUM_THREADS:-4}
 mkdir -p "${CKPT_DIR}"
 
 # ------------------------------------------------------------
-# 将每个数据集目录的 train 抽样物化为临时 Parquet
-# ------------------------------------------------------------
-if [ "${TRAIN_EVAL_SAMPLES_PER_DATASET}" -gt 0 ]; then
-    TRAIN_EVAL_SAMPLE_DIR=${TRAIN_EVAL_SAMPLE_DIR:-"${CKPT_DIR}/train_eval_samples"}
-    mkdir -p "${TRAIN_EVAL_SAMPLE_DIR}"
-
-    # 用数据集名和 seed 派生独立随机种子，保证某个目录的抽样不受
-    # 其他目录是否存在的影响。原始 Parquet 只读，输出采用原子替换。
-    SAMPLED_TRAIN_OUTPUT=$(python3 - \
-        "${DATA_ROOT}" \
-        "${TRAIN_EVAL_SAMPLE_DIR}" \
-        "${TRAIN_EVAL_SAMPLES_PER_DATASET}" \
-        "${TRAIN_EVAL_SEED}" \
-        "${DATASET_NAMES[@]}" <<'PY'
-import hashlib
-import os
-import sys
-from pathlib import Path
-
-import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pq
-
-data_root = Path(sys.argv[1])
-out_dir = Path(sys.argv[2])
-sample_size = int(sys.argv[3])
-base_seed = int(sys.argv[4])
-dataset_names = sys.argv[5:]
-
-for name in dataset_names:
-    train_files = sorted((data_root / name).glob("train_*.parquet"))
-    if not train_files:
-        raise FileNotFoundError(f"{data_root / name} 下无 train_*.parquet")
-
-    tables = [pq.read_table(path) for path in train_files]
-    table = tables[0] if len(tables) == 1 else pa.concat_tables(tables)
-    total = table.num_rows
-    count = min(sample_size, total)
-
-    seed_bytes = hashlib.sha256(f"{base_seed}:{name}".encode("utf-8")).digest()[:8]
-    rng = np.random.default_rng(int.from_bytes(seed_bytes, "little"))
-    indices = rng.choice(total, size=count, replace=False)
-    sampled = table.take(pa.array(indices, type=pa.int64()))
-
-    output = out_dir / f"{name}_train_sample_{count}.parquet"
-    temporary = output.with_suffix(output.suffix + ".tmp")
-    pq.write_table(sampled, temporary)
-    os.replace(temporary, output)
-
-    print(
-        f"  train 抽样: {name}: {count}/{total} -> {output}",
-        file=sys.stderr,
-    )
-    print(output)
-PY
-    )
-
-    while IFS= read -r sampled_file; do
-        [ -n "${sampled_file}" ] || continue
-        VAL_FILES="${VAL_FILES:+${VAL_FILES},}${sampled_file}"
-    done <<< "${SAMPLED_TRAIN_OUTPUT}"
-fi
-
-if [ -z "${VAL_FILES}" ]; then
-    echo "ERROR: 没有可评测的 val 数据或 train 抽样"
-    exit 1
-fi
-
-# ------------------------------------------------------------
 # 验证
 # ------------------------------------------------------------
 echo "============================================================"
-echo "RL1 验证集 + 训练集抽样评测 (verl 0.8.0 DAPO, ${NNODES}×${NGPUS_PER_NODE} GPU)"
+echo "RL1 正式训练 (verl 0.8.0 DAPO, ${NNODES}×${NGPUS_PER_NODE} GPU)"
 echo "============================================================"
 echo "  模型:           ${MODEL_PATH}"
 echo "  数据根目录:     ${DATA_ROOT}"
@@ -307,14 +192,13 @@ echo "  Reward:         ${REWARD_FILE}"
 echo "  R4 service:     ${R4_REWARD_URL} (batch=${R4_SERVER_MAX_BATCH_SIZE}, wait=${R4_SERVER_MAX_WAIT_MS}ms)"
 echo "  R4 model:       ${R4_MODEL_LOCAL_PATH} (Qwen3.5-9B, vLLM BF16 TP=${R4_VLLM_TENSOR_PARALLEL_SIZE})"
 echo "  R4 GPUs:        ${R4_CUDA_VISIBLE_DEVICES} (eager, KV cache=${R4_VLLM_KV_CACHE_BYTES} bytes/GPU)"
-echo "  Eval train:     每个数据集 ${TRAIN_EVAL_SAMPLES_PER_DATASET} 条 (seed=${TRAIN_EVAL_SEED})"
-echo "  Epochs/val_only:${TOTAL_EPOCHS} / ${VAL_ONLY}"
+echo "  Epochs:         ${TOTAL_EPOCHS} (ppo_epochs=1, 样本不重复迭代)"
 echo "  LR:             ${ACTOR_LR} (warmup steps=${ACTOR_LR_WARMUP_STEPS})"
 echo "  Batch:          train=${TRAIN_BATCH_SIZE}, mini=${PPO_MINI_BATCH_SIZE}, rollout_n=${ROLLOUT_N}"
 echo "  Prompt/Resp:    ${MAX_PROMPT_LENGTH} / ${MAX_RESPONSE_LENGTH}"
 echo "  GPU mem util:   ${ROLLOUT_GPU_MEM_UTIL}"
 echo "  Freeze vision:  ${FREEZE_VISION}"
-echo "  验证输出:       ${CKPT_DIR}/val_generations"
+echo "  Save/Test freq: ${SAVE_FREQ} / ${TEST_FREQ}"
 echo "  Checkpoint:     ${CKPT_DIR}"
 echo "============================================================"
 
@@ -503,7 +387,6 @@ TRAINER=(
     trainer.save_freq=${SAVE_FREQ}
     trainer.test_freq=${TEST_FREQ}
     trainer.val_before_train=${VAL_BEFORE_TRAIN}
-    trainer.val_only=${VAL_ONLY}
     trainer.total_epochs=${TOTAL_EPOCHS}
     trainer.default_local_dir="${CKPT_DIR}"
     trainer.resume_mode=${RESUME_MODE}
@@ -563,10 +446,10 @@ done
 echo "R4 reward service 已就绪 (pid=${R4_SERVER_PID})"
 
 # ------------------------------------------------------------
-# 启动 VERL 原生训练前验证
+# 启动训练
 # ------------------------------------------------------------
 echo ""
-echo "启动 RL1 评测 (verl 0.8.0 DAPO, 无训练)..."
+echo "启动 RL1 训练 (verl 0.8.0 DAPO)..."
 echo ""
 
 cd "${VERL_ROOT}"
@@ -583,4 +466,4 @@ python3 -m recipe.dapo.main_dapo \
     "${ALGO[@]}" \
     "${REWARD[@]}" \
     "${TRAINER[@]}" \
-    "${HYDRA_ARGS[@]}"
+    "$@"

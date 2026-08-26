@@ -112,7 +112,6 @@ class RayDAPOTrainer(RayPPOTrainer):
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
-                self._shutdown_dump_executor()
                 return
 
         # add tqdm
