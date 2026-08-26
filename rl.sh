@@ -20,9 +20,25 @@
 # 用法:
 #   bash rl.sh                        # 全参数训练
 #   FREEZE_VISION=1 bash rl.sh        # 冻结 vision（推荐）
+#   FREEZE_VISION=1 bash rl.sh --eval-train-samples
+#                                      # 验证集额外加入每个数据集的 200 条训练样本
 # ============================================================
 
 set -euo pipefail
+
+# rl.sh 自身只消费这一个开关，其余参数仍原样传给 Hydra。
+EVAL_TRAIN_SAMPLES=0
+HYDRA_ARGS=()
+for arg in "$@"; do
+    case "${arg}" in
+        --eval-train-samples)
+            EVAL_TRAIN_SAMPLES=1
+            ;;
+        *)
+            HYDRA_ARGS+=("${arg}")
+            ;;
+    esac
+done
 
 # ------------------------------------------------------------
 # 路径
@@ -84,6 +100,46 @@ for name in "${DATASET_NAMES[@]}"; do
         [ -f "${vf}" ] || continue
         VAL_FILES="${VAL_FILES:+${VAL_FILES},}${vf}"
     done
+
+    # 只有显式传入 --eval-train-samples 时，才生成/加入额外验证集。
+    # val1_0001.parquet 不匹配上面的 val_*.parquet，因此不会重复加入。
+    if [ "${EVAL_TRAIN_SAMPLES}" -eq 1 ]; then
+        extra_val="${dir}/val1_0001.parquet"
+        if [ ! -f "${extra_val}" ]; then
+            python3 - "${dir}" "${extra_val}" <<'PY'
+import os
+import random
+import sys
+from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+data_dir = Path(sys.argv[1])
+output = Path(sys.argv[2])
+train_files = sorted(data_dir.glob("train_*.parquet"))
+if not train_files:
+    raise FileNotFoundError(f"{data_dir} 下没有 train_*.parquet")
+
+tables = [pq.read_table(path) for path in train_files]
+table = tables[0] if len(tables) == 1 else pa.concat_tables(tables)
+if table.num_rows == 0:
+    raise ValueError(f"{data_dir} 下的训练 Parquet 为空")
+
+count = min(200, table.num_rows)
+indices = sorted(random.Random(42).sample(range(table.num_rows), count))
+sampled = table.take(pa.array(indices, type=pa.int64()))
+
+temporary = output.with_suffix(output.suffix + ".tmp")
+pq.write_table(sampled, temporary)
+os.replace(temporary, output)
+print(f"  [INFO] 已从 {len(train_files)} 个训练文件复制 {count}/{table.num_rows} 条 -> {output}")
+PY
+        else
+            echo "  [INFO] 复用已有附加验证集: ${extra_val}"
+        fi
+        VAL_FILES="${VAL_FILES:+${VAL_FILES},}${extra_val}"
+    fi
 done
 
 # 如果没有独立的 val 文件，回退到用 train 文件做验证
@@ -466,4 +522,4 @@ python3 -m recipe.dapo.main_dapo \
     "${ALGO[@]}" \
     "${REWARD[@]}" \
     "${TRAINER[@]}" \
-    "$@"
+    "${HYDRA_ARGS[@]}"
