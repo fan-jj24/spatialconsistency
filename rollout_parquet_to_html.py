@@ -23,11 +23,11 @@ local checkpoint is replaced, while an existing complete Gemini checkpoint is
 validated and reused without making any Gemini/OSS requests.  If a local run is
 interrupted, repeat the command with ``--resume``.
 
-Generating a new Gemini checkpoint requires ``IDEALAB_API_KEY`` plus the four
-``OUTER_OSS_*`` variables used by ``run_gemini.py``; reusing one does not.  After
-both rollout paths finish, this script releases the local generation model,
-starts ``reward_model_server.py``, waits for its health check, calculates all
-rewards, and then stops the reward service.
+Generating a new Gemini checkpoint reads ``ak``, ``sk``, ``ep``, ``bn``, and
+``api_key`` from a non-versioned ``key.py`` beside this script; reusing one does
+not need that file.  After both rollout paths finish, this script releases the
+local generation model, starts ``reward_model_server.py``, waits for its health
+check, calculates all rewards, and then stops the reward service.
 """
 
 from __future__ import annotations
@@ -38,11 +38,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 import gc
 import hashlib
+import importlib.util
 import json
 import math
 import os
 import random
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -62,6 +64,7 @@ GEMINI_MODEL = "gemini-3.5-flash"
 # 本地路由计算 C/R2/R3/R4/reward，Gemini 路由只计算 C/R4。
 LOCAL_DATA_SOURCE = reward.INCONSISTENT_COT_LOCAL_EVAL_SOURCE
 GEMINI_DATA_SOURCE = reward.INCONSISTENT_COT_GEMINI_EVAL_SOURCE
+KEY_PATH = Path(__file__).with_name("key.py")
 
 
 def _gemini_module():
@@ -90,6 +93,48 @@ class EvalRow:
     local_scores: dict[str, float] | None = None
     gemini_scores: dict[str, float] | None = None
     evaluation_error: str = ""
+
+
+@dataclass(frozen=True)
+class GeminiCredentials:
+    ak: str
+    sk: str
+    ep: str
+    bn: str
+    api_key: str
+
+
+def _load_gemini_credentials(path: Path | None = None) -> GeminiCredentials:
+    """Load Gemini and OSS credentials only from key.py beside this script."""
+    key_path = path or KEY_PATH
+    if not key_path.is_file():
+        raise FileNotFoundError(
+            f"找不到 {key_path}；请在其中定义 ak、sk、ep、bn、api_key"
+        )
+    spec = importlib.util.spec_from_file_location("_rollout_local_key", key_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"无法加载 {key_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    names = ("ak", "sk", "ep", "bn", "api_key")
+    values = {name: str(getattr(module, name, "")).strip() for name in names}
+    missing = [name for name in names if not values[name]]
+    if missing:
+        raise ValueError(f"{key_path} 缺少非空配置: {', '.join(missing)}")
+    return GeminiCredentials(**values)
+
+
+def _copy_reused_gemini_checkpoint(reuse_dir: Path, out_dir: Path) -> Path:
+    source = reuse_dir / "gemini_results.jsonl"
+    destination = out_dir / "gemini_results.jsonl"
+    if not reuse_dir.is_dir():
+        raise FileNotFoundError(f"Gemini 复用目录不存在: {reuse_dir}")
+    if not source.is_file():
+        raise FileNotFoundError(f"Gemini 复用目录中缺少: {source}")
+    if source.resolve() != destination.resolve():
+        shutil.copy2(source, destination)
+        print(f"复制 Gemini checkpoint: {source} -> {destination}")
+    return destination
 
 
 def _require_datasets():
@@ -177,6 +222,7 @@ def _content_image(image, original: dict[str, Any] | None = None) -> dict[str, A
 def build_messages_and_images(
     row: dict[str, Any],
     data_path: Path,
+    reveal_gt_answer: bool = False,
 ) -> tuple[list[dict[str, Any]], list[Any]]:
     prompt = annotation._plain(row.get("prompt"))
     if not isinstance(prompt, list) or not prompt:
@@ -222,6 +268,25 @@ def build_messages_and_images(
         raise ValueError(
             f"prompt 使用了 {image_offset} 幅图，但 images 字段有 {len(images)} 幅"
         )
+    if reveal_gt_answer:
+        ground_truth = annotation._plain(annotation._ground_truth(row))
+        if isinstance(ground_truth, str):
+            try:
+                ground_truth = json.loads(ground_truth)
+            except json.JSONDecodeError as exc:
+                raise ValueError("GT 不是包含 answer 的 JSON object") from exc
+        if not isinstance(ground_truth, dict) or "answer" not in ground_truth:
+            raise ValueError("GT 中找不到 answer，无法使用 --reveal_gt_answer")
+        answer = annotation._plain(ground_truth["answer"])
+        if answer is None:
+            raise ValueError("GT 的 answer 为空，无法使用 --reveal_gt_answer")
+        answer_text = (
+            answer
+            if isinstance(answer, str)
+            else json.dumps(answer, ensure_ascii=False, separators=(",", ":"))
+        )
+        # Intentionally add only the answer value: no label, instruction, or other GT.
+        messages.append({"role": "user", "content": answer_text})
     return messages, images
 
 
@@ -287,7 +352,9 @@ def _prepare_gemini_request(
     oss_handler,
     args: argparse.Namespace,
 ) -> list[dict[str, Any]]:
-    messages, images = build_messages_and_images(eval_row.row, data_path)
+    messages, images = build_messages_and_images(
+        eval_row.row, data_path, args.reveal_gt_answer
+    )
     input_dir = out_dir / "gemini_inputs" / f"row_{eval_row.source_row:08d}"
     input_dir.mkdir(parents=True, exist_ok=True)
     dataset_key = _gemini_dataset_key(data_path)
@@ -362,7 +429,9 @@ class TransformersRollout:
         texts: list[str] = []
         all_images: list[Any] = []
         for eval_row in rows:
-            messages, images = build_messages_and_images(eval_row.row, data_path)
+            messages, images = build_messages_and_images(
+                eval_row.row, data_path, self.args.reveal_gt_answer
+            )
             text = self.processor.apply_chat_template(
                 messages,
                 tokenize=False,
@@ -468,6 +537,7 @@ def _append_checkpoint(path: Path, eval_row: EvalRow, args: argparse.Namespace) 
         "top_k": args.top_k,
         "repetition_penalty": args.repetition_penalty,
         "max_new_tokens": args.max_new_tokens,
+        "reveal_gt_answer": args.reveal_gt_answer,
     }
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -497,6 +567,8 @@ def _validate_checkpoint(
         if source_row not in selected:
             continue
         mismatched = [key for key, value in expected.items() if saved.get(key) != value]
+        if bool(saved.get("reveal_gt_answer", False)) != args.reveal_gt_answer:
+            mismatched.append("reveal_gt_answer")
         if saved.get("data_source") != selected[source_row].local_data_source:
             mismatched.append("data_source")
         if mismatched:
@@ -577,6 +649,7 @@ def _append_gemini_checkpoint(
         "data_path": str(Path(args.data_path)),
         "gemini_model": GEMINI_MODEL,
         "gemini_thinking_level": args.gemini_thinking_level,
+        "reveal_gt_answer": args.reveal_gt_answer,
     }
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -597,6 +670,8 @@ def _validate_gemini_checkpoint(
         if source_row not in selected:
             continue
         mismatched = [key for key, value in expected.items() if saved.get(key) != value]
+        if bool(saved.get("reveal_gt_answer", False)) != args.reveal_gt_answer:
+            mismatched.append("reveal_gt_answer")
         if saved.get("data_source") != selected[source_row].gemini_data_source:
             mismatched.append("data_source")
         if saved.get("ground_truth") != selected[source_row].ground_truth:
@@ -614,10 +689,14 @@ def run_gemini_rollout(
     out_dir: Path,
     checkpoint_path: Path,
     args: argparse.Namespace,
+    credentials: GeminiCredentials | None = None,
+    oss_handler=None,
+    trusted_checkpoint: bool = False,
 ) -> None:
     checkpoint_exists = checkpoint_path.is_file()
     completed = _read_checkpoint(checkpoint_path) if checkpoint_exists else {}
-    _validate_gemini_checkpoint(completed, rows, args)
+    if not trusted_checkpoint:
+        _validate_gemini_checkpoint(completed, rows, args)
     if checkpoint_exists:
         missing = [row.source_row for row in rows if row.source_row not in completed]
         if missing:
@@ -641,16 +720,11 @@ def run_gemini_rollout(
     if not pending:
         return
 
-    api_key = os.environ.get("IDEALAB_API_KEY", "")
-    if not api_key:
-        raise RuntimeError("启用 Gemini 需要环境变量 IDEALAB_API_KEY")
     gemini_module = _gemini_module()
-    oss_handler = gemini_module.build_outer_handler_from_env()
-    if oss_handler is None:
-        raise RuntimeError(
-            "启用 Gemini 需要 OUTER_OSS_ACCESS_KEY_ID、OUTER_OSS_ACCESS_KEY_SECRET、"
-            "OUTER_OSS_ENDPOINT、OUTER_OSS_BUCKET_NAME"
-        )
+    credentials = credentials or _load_gemini_credentials()
+    oss_handler = oss_handler or gemini_module.OuterOSSHandle(
+        credentials.ak, credentials.sk, credentials.ep, credentials.bn
+    )
 
     def generate_one(row: EvalRow) -> tuple[str, str]:
         try:
@@ -658,7 +732,7 @@ def run_gemini_rollout(
                 row, data_path, out_dir, oss_handler, args
             )
             result = gemini_module.call_idealab(
-                api_key,
+                credentials.api_key,
                 GEMINI_SYSTEM_PROMPT,
                 user_content,
                 max_retries=args.gemini_max_retries,
@@ -869,6 +943,7 @@ def write_evaluation_results(
                 "gemini_scores": row.gemini_scores or {},
                 "evaluation_error": row.evaluation_error,
                 "temperature": args.temperature,
+                "reveal_gt_answer": args.reveal_gt_answer,
                 "gemini_model": GEMINI_MODEL if args.gemini else None,
             }
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -969,7 +1044,8 @@ def build_report(
     subtitle = (
         f"模型 {model_name} · 数据 {data_path.name} · {len(rows)} 条 · "
         f"temperature={args.temperature:g} · Gemini="
-        f"{GEMINI_MODEL if args.gemini else '关闭'}"
+        f"{GEMINI_MODEL if args.gemini else '关闭'} · "
+        f"透露GT answer={'是' if args.reveal_gt_answer else '否'}"
     )
     annotation.build_html(
         cases,
@@ -995,6 +1071,11 @@ def parse_args() -> argparse.Namespace:
                         help="输入 VERL train.parquet 地址")
     parser.add_argument("--out_dir", "--out-dir", required=True,
                         help="输出目录（包含 checkpoint、assets 和 index.html）")
+    parser.add_argument(
+        "--reveal_gt_answer", "--reveal-gt-answer",
+        action="store_true",
+        help="在原 prompt 后单独追加 GT 的 answer 值，不追加任何其他 GT 内容",
+    )
     parser.add_argument("--num_samples", "--num-samples", type=int, default=100,
                         help="评测条数，默认 100")
     parser.add_argument("--selection", choices=("random", "first"), default="random",
@@ -1030,6 +1111,12 @@ def parse_args() -> argparse.Namespace:
                         default=True, help="是否允许模型仓库代码，默认开启")
     parser.add_argument("--gemini", action=argparse.BooleanOptionalAction, default=True,
                         help="是否并行调用 Gemini，默认开启；离线调试可用 --no-gemini")
+    parser.add_argument(
+        "--reuse_gemini_dir", "--reuse-gemini-dir",
+        help=(
+            "旧输出目录；把其中 gemini_results.jsonl 复制到本次输出并跳过 Gemini API"
+        ),
+    )
     parser.add_argument("--gemini_workers", "--gemini-workers", type=int, default=10,
                         help="Gemini API 并发数，默认 10")
     parser.add_argument("--gemini_max_retries", "--gemini-max-retries", type=int, default=3,
@@ -1038,7 +1125,7 @@ def parse_args() -> argparse.Namespace:
                         choices=("low", "medium", "high"), default="high",
                         help="Gemini thinking 等级，默认 high")
     parser.add_argument("--gemini_oss_prefix", "--gemini-oss-prefix",
-                        default="spatialconsistency/rollout",
+                        default="yk/ai-material/neo/fjj/rollout",
                         help="上传 Gemini 输入图片使用的 OSS key 前缀")
     parser.add_argument("--gemini_max_image_edge", "--gemini-max-image-edge", type=int,
                         default=2048, help="Gemini 输入图片上传前的最长边，默认 2048")
@@ -1133,6 +1220,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--resume 和 --overwrite 不能同时使用")
     if args.retry_errors and not args.resume:
         parser.error("--retry_errors 必须与 --resume 一起使用")
+    if args.reuse_gemini_dir and not args.gemini:
+        parser.error("--reuse_gemini_dir 不能与 --no-gemini 同时使用")
     return args
 
 
@@ -1152,26 +1241,26 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     local_checkpoint_path = out_dir / "rollout_results.jsonl"
     gemini_checkpoint_path = out_dir / "gemini_results.jsonl"
-    reuse_gemini = args.gemini and gemini_checkpoint_path.is_file()
-    if args.gemini and not reuse_gemini:
-        missing_env = [
-            name for name in (
-                "IDEALAB_API_KEY",
-                "OUTER_OSS_ACCESS_KEY_ID",
-                "OUTER_OSS_ACCESS_KEY_SECRET",
-                "OUTER_OSS_ENDPOINT",
-                "OUTER_OSS_BUCKET_NAME",
-            ) if not os.environ.get(name)
-        ]
-        if missing_env:
-            raise SystemExit(
-                "ERROR: 启用 Gemini 缺少环境变量: " + ", ".join(missing_env)
-            )
+    trusted_gemini_checkpoint = False
+    if args.reuse_gemini_dir:
+        reuse_dir = Path(args.reuse_gemini_dir).expanduser().resolve()
         try:
-            if _gemini_module().build_outer_handler_from_env() is None:
-                raise RuntimeError("OSS 配置不完整")
+            _copy_reused_gemini_checkpoint(reuse_dir, out_dir)
+        except FileNotFoundError as exc:
+            raise SystemExit(f"ERROR: {exc}") from exc
+        trusted_gemini_checkpoint = True
+    reuse_gemini = args.gemini and gemini_checkpoint_path.is_file()
+    credentials = None
+    oss_handler = None
+    if args.gemini and not reuse_gemini:
+        try:
+            credentials = _load_gemini_credentials()
+            gemini_module = _gemini_module()
+            oss_handler = gemini_module.OuterOSSHandle(
+                credentials.ak, credentials.sk, credentials.ep, credentials.bn
+            )
         except Exception as exc:
-            raise SystemExit(f"ERROR: Gemini/OSS 初始化失败: {exc}") from exc
+            raise SystemExit(f"ERROR: 从 key.py 初始化 Gemini/OSS 失败: {exc}") from exc
 
     print(f"读取数据: {data_path}")
     rows, total = load_eval_rows(
@@ -1187,7 +1276,12 @@ def main() -> None:
     )
     if reuse_gemini:
         run_gemini_rollout(
-            rows, data_path, out_dir, gemini_checkpoint_path, args
+            rows,
+            data_path,
+            out_dir,
+            gemini_checkpoint_path,
+            args,
+            trusted_checkpoint=trusted_gemini_checkpoint,
         )
 
     if local_checkpoint_path.exists() and not args.resume:
@@ -1208,6 +1302,8 @@ def main() -> None:
                     out_dir,
                     gemini_checkpoint_path,
                     args,
+                    credentials,
+                    oss_handler,
                 ),
             ]
             for future in as_completed(futures):
