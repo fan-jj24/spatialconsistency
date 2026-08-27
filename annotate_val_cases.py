@@ -484,7 +484,8 @@ def _dashed_rectangle(draw, bbox, fill, width: int) -> None:
     _dashed_line(draw, (x1, y2), (x1, y1), fill, width)
 
 
-def _direction(label: str, bbox: list[float]) -> tuple[float, float] | None:
+def _direction(label: str, bbox: list[float]) -> tuple[float, ...] | None:
+    """Return a 2D image displacement or an unprojected 3D direction vector."""
     match = _VECTOR_RE.search(label)
     if not match:
         return None
@@ -492,12 +493,14 @@ def _direction(label: str, bbox: list[float]) -> tuple[float, float] | None:
         values = [float(part) for part in re.split(r"[,\s]+", match.group(1).strip()) if part]
     except ValueError:
         return None
+    if not all(math.isfinite(value) for value in values):
+        return None
     if len(values) == 2:
         cx = (bbox[0] + bbox[2]) / 2.0
         cy = (bbox[1] + bbox[3]) / 2.0
         return values[0] - cx, values[1] - cy
     if len(values) == 3:
-        return values[0], -values[1]
+        return values[0], values[1], values[2]
     return None
 
 
@@ -519,12 +522,117 @@ def _arrow(draw, center, direction, color, width: int, sx: float, sy: float) -> 
     draw.polygon(points, fill=color)
 
 
+def _dashed_ellipse(draw, bbox, fill, width: int) -> None:
+    """Draw a dashed ellipse using short Pillow arc segments."""
+    for start in range(0, 360, 28):
+        draw.arc(bbox, start=start, end=min(start + 18, 360), fill=fill, width=width)
+
+
+def _arrow_3d(draw, center, direction, color, width: int, bbox) -> bool:
+    """Draw a conspicuous 3D direction glyph and return whether it was valid.
+
+    The visual language follows the annotation UI: a dashed sphere shows the
+    local 3D frame, the arrow shaft shows the XY projection, a filled dot means
+    the arrow points out of the image, and an X means it points into the image.
+    """
+    dx, dy, dz = direction
+    magnitude = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if magnitude < 1e-6:
+        return False
+    dx, dy, dz = dx / magnitude, dy / magnitude, dz / magnitude
+
+    x1, y1, x2, y2 = bbox
+    box_width = abs(x2 - x1)
+    box_height = abs(y2 - y1)
+    display_scale = max(0.75, width / 3.0)
+    radius = max(
+        18.0 * display_scale,
+        min(70.0 * display_scale, box_width / 1.5, box_height / 1.5),
+    )
+    sphere_width = max(3, width * 2)
+    shaft_width = max(6, width * 4)
+    sphere_bbox = (
+        center[0] - radius,
+        center[1] - radius,
+        center[0] + radius,
+        center[1] + radius,
+    )
+    draw.ellipse(sphere_bbox, fill=(*color, 38))
+    _dashed_ellipse(draw, sphere_bbox, color, sphere_width)
+
+    end = (center[0] + dx * radius, center[1] - dy * radius)
+    projected_length = math.hypot(end[0] - center[0], end[1] - center[1])
+    if projected_length >= 1e-6:
+        if dz > 0.3:
+            _dashed_line(
+                draw,
+                center,
+                end,
+                color,
+                shaft_width,
+                dash=max(8, shaft_width * 2),
+            )
+        else:
+            draw.line([center, end], fill=color, width=shaft_width)
+
+        angle = math.atan2(end[1] - center[1], end[0] - center[0])
+        head = max(14, width * 6)
+        arrow_points = [end]
+        for delta in (0.52, -0.52):
+            arrow_points.append((
+                end[0] - head * math.cos(angle + delta),
+                end[1] - head * math.sin(angle + delta),
+            ))
+        draw.polygon(arrow_points, fill=color)
+
+    marker_radius = max(10, width * 4)
+    if dz < -0.2:
+        draw.ellipse(
+            (
+                end[0] - marker_radius,
+                end[1] - marker_radius,
+                end[0] + marker_radius,
+                end[1] + marker_radius,
+            ),
+            fill=color,
+            outline=(255, 255, 255),
+            width=max(2, width),
+        )
+    elif dz > 0.2:
+        cross = marker_radius * 0.75
+        cross_width = max(3, width * 2)
+        draw.line(
+            [(end[0] - cross, end[1] - cross), (end[0] + cross, end[1] + cross)],
+            fill=(255, 255, 255),
+            width=cross_width,
+        )
+        draw.line(
+            [(end[0] + cross, end[1] - cross), (end[0] - cross, end[1] + cross)],
+            fill=(255, 255, 255),
+            width=cross_width,
+        )
+
+    center_radius = max(4, width * 2)
+    draw.ellipse(
+        (
+            center[0] - center_radius,
+            center[1] - center_radius,
+            center[0] + center_radius,
+            center[1] + center_radius,
+        ),
+        fill=(255, 255, 255),
+        outline=color,
+        width=max(2, width),
+    )
+    return True
+
+
 def annotate_second_image(image, gt_boxes, pred_boxes):
     """Draw every GT and prediction independently; there is no bbox matching."""
     from PIL import ImageDraw
 
     result = image.copy()
-    draw = ImageDraw.Draw(result)
+    draw = ImageDraw.Draw(result, "RGBA")
     width, height = result.size
     line_width = max(2, round(max(width, height) / 350))
     gt_color = (225, 45, 45)
@@ -533,22 +641,32 @@ def annotate_second_image(image, gt_boxes, pred_boxes):
     for index, (bbox, label) in enumerate(gt_boxes, 1):
         scaled = _scaled_bbox(bbox, width, height)
         draw.rectangle(scaled, outline=gt_color, width=line_width)
-        draw.text((scaled[0] + 3, scaled[1] + 3), f"GT {index}", fill=gt_color,
-                  stroke_width=2, stroke_fill=(255, 255, 255))
         direction = _direction(label, bbox)
-        if direction:
-            center = ((scaled[0] + scaled[2]) / 2, (scaled[1] + scaled[3]) / 2)
+        center = ((scaled[0] + scaled[2]) / 2, (scaled[1] + scaled[3]) / 2)
+        has_3d_arrow = bool(
+            direction and len(direction) == 3
+            and _arrow_3d(draw, center, direction, gt_color, line_width, scaled)
+        )
+        if not has_3d_arrow:
+            draw.text((scaled[0] + 3, scaled[1] + 3), f"GT {index}", fill=gt_color,
+                      stroke_width=2, stroke_fill=(255, 255, 255))
+        if direction and len(direction) == 2:
             _arrow(draw, center, direction, gt_color, line_width,
                    width / 1000.0, height / 1000.0)
 
     for index, (bbox, label) in enumerate(pred_boxes, 1):
         scaled = _scaled_bbox(bbox, width, height)
         _dashed_rectangle(draw, scaled, pred_color, line_width)
-        draw.text((scaled[0] + 3, scaled[1] + 19), f"P {index}", fill=pred_color,
-                  stroke_width=2, stroke_fill=(255, 255, 255))
         direction = _direction(label, bbox)
-        if direction:
-            center = ((scaled[0] + scaled[2]) / 2, (scaled[1] + scaled[3]) / 2)
+        center = ((scaled[0] + scaled[2]) / 2, (scaled[1] + scaled[3]) / 2)
+        has_3d_arrow = bool(
+            direction and len(direction) == 3
+            and _arrow_3d(draw, center, direction, pred_color, line_width, scaled)
+        )
+        if not has_3d_arrow:
+            draw.text((scaled[0] + 3, scaled[1] + 19), f"P {index}", fill=pred_color,
+                      stroke_width=2, stroke_fill=(255, 255, 255))
+        if direction and len(direction) == 2:
             _arrow(draw, center, direction, pred_color, line_width,
                    width / 1000.0, height / 1000.0)
     return result
