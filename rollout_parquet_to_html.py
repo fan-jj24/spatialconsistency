@@ -22,9 +22,9 @@ Local and Gemini results are checkpointed separately.  If a run is interrupted,
 repeat the command with ``--resume``.
 
 Gemini requires ``IDEALAB_API_KEY`` plus the four ``OUTER_OSS_*`` variables
-used by ``run_gemini.py``.  Summary reward R4 uses ``R4_REWARD_URL`` (default
-``http://127.0.0.1:8765``), so start ``reward_model_server.py`` first or point
-the variable at an existing reward service.
+used by ``run_gemini.py``.  After both rollout paths finish, this script releases
+the local generation model, starts ``reward_model_server.py``, waits for its
+health check, calculates all rewards, and then stops the reward service.
 """
 
 from __future__ import annotations
@@ -32,14 +32,23 @@ from __future__ import annotations
 import argparse
 import copy
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
+import gc
 import hashlib
 import json
+import math
 import os
 import random
 import re
+import signal
+import subprocess
+import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import urlopen
 
 import annotate_val_cases as annotation
 import json_answer_reward as reward
@@ -404,6 +413,21 @@ class TransformersRollout:
             clean_up_tokenization_spaces=False,
         )
 
+    def close(self) -> None:
+        """Release the rollout model before the R4 process claims the GPU."""
+        model = self.model
+        self.model = None
+        self.processor = None
+        self.tokenizer = None
+        del model
+        gc.collect()
+        if self.torch.cuda.is_available():
+            self.torch.cuda.empty_cache()
+            try:
+                self.torch.cuda.ipc_collect()
+            except (AttributeError, RuntimeError):
+                pass
+
 
 def _read_checkpoint(path: Path) -> dict[int, dict[str, Any]]:
     completed: dict[int, dict[str, Any]] = {}
@@ -500,35 +524,39 @@ def run_rollout(
         return
 
     engine = TransformersRollout(args)
-    engine.torch.manual_seed(args.generation_seed)
-    if engine.torch.cuda.is_available():
-        engine.torch.cuda.manual_seed_all(args.generation_seed)
+    try:
+        engine.torch.manual_seed(args.generation_seed)
+        if engine.torch.cuda.is_available():
+            engine.torch.cuda.manual_seed_all(args.generation_seed)
 
-    completed_count = len(rows) - len(pending)
-    for start in range(0, len(pending), args.batch_size):
-        batch = pending[start : start + args.batch_size]
-        try:
-            predictions = engine.generate(batch, data_path)
-            for row, prediction in zip(batch, predictions, strict=True):
-                row.prediction = prediction
-        except Exception as batch_exc:
-            if len(batch) == 1:
-                batch[0].generation_error = f"{type(batch_exc).__name__}: {batch_exc}"
-                print(f"  [WARN] Parquet row {batch[0].source_row} 生成失败: {batch_exc}")
-            else:
-                print(f"  [WARN] batch 生成失败，逐条重试: {batch_exc}")
-                if engine.torch.cuda.is_available():
-                    engine.torch.cuda.empty_cache()
-                for row in batch:
-                    try:
-                        row.prediction = engine.generate([row], data_path)[0]
-                    except Exception as row_exc:
-                        row.generation_error = f"{type(row_exc).__name__}: {row_exc}"
-                        print(f"  [WARN] Parquet row {row.source_row} 生成失败: {row_exc}")
-        for row in batch:
-            _append_checkpoint(checkpoint_path, row, args)
-            completed_count += 1
-        print(f"  rollout {completed_count}/{len(rows)}")
+        completed_count = len(rows) - len(pending)
+        for start in range(0, len(pending), args.batch_size):
+            batch = pending[start : start + args.batch_size]
+            try:
+                predictions = engine.generate(batch, data_path)
+                for row, prediction in zip(batch, predictions, strict=True):
+                    row.prediction = prediction
+            except Exception as batch_exc:
+                if len(batch) == 1:
+                    batch[0].generation_error = f"{type(batch_exc).__name__}: {batch_exc}"
+                    print(f"  [WARN] Parquet row {batch[0].source_row} 生成失败: {batch_exc}")
+                else:
+                    print(f"  [WARN] batch 生成失败，逐条重试: {batch_exc}")
+                    if engine.torch.cuda.is_available():
+                        engine.torch.cuda.empty_cache()
+                    for row in batch:
+                        try:
+                            row.prediction = engine.generate([row], data_path)[0]
+                        except Exception as row_exc:
+                            row.generation_error = f"{type(row_exc).__name__}: {row_exc}"
+                            print(f"  [WARN] Parquet row {row.source_row} 生成失败: {row_exc}")
+            for row in batch:
+                _append_checkpoint(checkpoint_path, row, args)
+                completed_count += 1
+            print(f"  rollout {completed_count}/{len(rows)}")
+    finally:
+        print("释放本地 rollout 模型和 CUDA 缓存...")
+        engine.close()
 
 
 def _append_gemini_checkpoint(
@@ -642,6 +670,107 @@ def run_gemini_rollout(
             if row.gemini_error:
                 print(f"  [WARN] Gemini row {row.source_row}: {row.gemini_error}")
             print(f"  Gemini {completed_count}/{len(rows)}")
+
+
+def _stop_reward_server(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    if sys.platform == "win32" and hasattr(signal, "CTRL_BREAK_EVENT"):
+        process.send_signal(signal.CTRL_BREAK_EVENT)
+    else:
+        process.terminate()
+    try:
+        process.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=10)
+
+
+def _wait_for_reward_server(
+    process: subprocess.Popen,
+    health_url: str,
+    timeout_seconds: float,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    last_status = "等待 reward model 加载"
+    while time.monotonic() < deadline:
+        return_code = process.poll()
+        if return_code is not None:
+            raise RuntimeError(
+                f"reward_model_server.py 在就绪前退出（exit={return_code}）"
+            )
+        try:
+            with urlopen(health_url, timeout=2) as response:
+                if response.status == 200:
+                    return
+                last_status = f"HTTP {response.status}"
+        except HTTPError as exc:
+            if exc.code == 503:
+                last_status = "reward model 仍在加载"
+            else:
+                body = exc.read().decode("utf-8", errors="replace")
+                raise RuntimeError(
+                    f"reward service 健康检查失败：HTTP {exc.code}: {body}"
+                ) from exc
+        except (URLError, TimeoutError) as exc:
+            last_status = str(getattr(exc, "reason", exc))
+        time.sleep(0.5)
+    raise TimeoutError(
+        f"reward model 在 {timeout_seconds:g} 秒内未就绪：{last_status}"
+    )
+
+
+@contextmanager
+def reward_server_for_scoring(args: argparse.Namespace):
+    """Start R4 only after rollout, then always stop the child process."""
+    if not args.auto_reward_server:
+        print("使用外部 reward service（本脚本不启动或停止它）...")
+        yield
+        return
+
+    server_script = Path(__file__).resolve().with_name("reward_model_server.py")
+    if not server_script.is_file():
+        raise FileNotFoundError(f"reward server 脚本不存在: {server_script}")
+
+    host = args.reward_host
+    client_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    base_url = f"http://{client_host}:{args.reward_port}"
+    command = [
+        sys.executable,
+        str(server_script),
+        "--host",
+        host,
+        "--port",
+        str(args.reward_port),
+        "--max-batch-size",
+        str(args.reward_max_batch_size),
+        "--max-wait-ms",
+        str(args.reward_max_wait_ms),
+    ]
+    print(f"rollout 已完成，启动 reward model: {base_url}")
+    popen_kwargs = {"cwd": str(server_script.parent)}
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    process = subprocess.Popen(command, **popen_kwargs)
+    old_reward_url = os.environ.get("R4_REWARD_URL")
+    os.environ["R4_REWARD_URL"] = base_url
+    try:
+        _wait_for_reward_server(
+            process,
+            f"{base_url}/health",
+            args.reward_start_timeout,
+        )
+        print("reward model 已就绪，开始计算奖励...")
+        yield
+    finally:
+        print("停止本次自动启动的 reward model...")
+        try:
+            _stop_reward_server(process)
+        finally:
+            if old_reward_url is None:
+                os.environ.pop("R4_REWARD_URL", None)
+            else:
+                os.environ["R4_REWARD_URL"] = old_reward_url
 
 
 def calculate_rewards(
@@ -891,6 +1020,37 @@ def parse_args() -> argparse.Namespace:
                         default=2048, help="Gemini 输入图片上传前的最长边，默认 2048")
     parser.add_argument("--reward_workers", "--reward-workers", type=int, default=8,
                         help="奖励计算并发数，默认 8，便于 R4 服务动态合批")
+    parser.add_argument(
+        "--auto_reward_server", "--auto-reward-server",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "rollout 后自动启动/停止 reward_model_server.py，默认开启；"
+            "使用已有服务时传 --no-auto-reward-server"
+        ),
+    )
+    parser.add_argument("--reward_host", "--reward-host", default="127.0.0.1",
+                        help="自动 reward service 监听地址，默认 127.0.0.1")
+    parser.add_argument("--reward_port", "--reward-port", type=int, default=8765,
+                        help="自动 reward service 端口，默认 8765")
+    parser.add_argument(
+        "--reward_start_timeout", "--reward-start-timeout",
+        type=float,
+        default=900.0,
+        help="等待 reward model 加载的超时秒数，默认 900",
+    )
+    parser.add_argument(
+        "--reward_max_batch_size", "--reward-max-batch-size",
+        type=int,
+        default=32,
+        help="R4 服务动态合批上限，默认 32",
+    )
+    parser.add_argument(
+        "--reward_max_wait_ms", "--reward-max-wait-ms",
+        type=float,
+        default=20.0,
+        help="R4 服务动态合批等待时间，默认 20ms",
+    )
     parser.add_argument("--max_image_edge", "--max-image-edge", type=int, default=1200)
     parser.add_argument("--jpeg_quality", "--jpeg-quality", type=int, default=88)
     args = parser.parse_args()
@@ -901,6 +1061,16 @@ def parse_args() -> argparse.Namespace:
         parser.error("--batch_size 必须大于 0")
     if args.gemini_workers <= 0 or args.reward_workers <= 0:
         parser.error("Gemini/reward workers 必须大于 0")
+    if not args.reward_host.strip():
+        parser.error("--reward_host 不能为空")
+    if not 1 <= args.reward_port <= 65535:
+        parser.error("--reward_port 必须在 1 到 65535 之间")
+    if not math.isfinite(args.reward_start_timeout) or args.reward_start_timeout <= 0:
+        parser.error("--reward_start_timeout 必须大于 0")
+    if args.reward_max_batch_size <= 0:
+        parser.error("--reward_max_batch_size 必须大于 0")
+    if not math.isfinite(args.reward_max_wait_ms) or args.reward_max_wait_ms < 0:
+        parser.error("--reward_max_wait_ms 不能小于 0")
     if args.gemini_max_retries <= 0:
         parser.error("--gemini_max_retries 必须大于 0")
     if args.max_prompt_length <= 0 or args.max_new_tokens <= 0:
@@ -1008,8 +1178,18 @@ def main() -> None:
         print("Gemini：关闭；运行本地模型...")
         run_rollout(rows, data_path, local_checkpoint_path, args)
 
-    print("两路生成完成，计算每个 case 的奖励明细...")
-    calculate_rewards(rows, args)
+    print("两路生成完成。")
+    has_scorable_output = any(
+        (row.prediction and not row.generation_error)
+        or (args.gemini and row.gemini_prediction and not row.gemini_error)
+        for row in rows
+    )
+    if has_scorable_output:
+        with reward_server_for_scoring(args):
+            calculate_rewards(rows, args)
+    else:
+        print("没有可评分的生成结果，不启动 reward model。")
+        calculate_rewards(rows, args)
     evaluation_path = out_dir / "evaluation_results.jsonl"
     write_evaluation_results(rows, evaluation_path, args)
     out_path = build_report(rows, data_path, out_dir, args)

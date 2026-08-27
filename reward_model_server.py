@@ -282,6 +282,8 @@ def run_server(args) -> int:
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, handle_signal)
 
     batcher = None
     model = None
