@@ -839,7 +839,7 @@ pre { margin:0; padding:10px; min-height:110px; max-height:300px; overflow:auto;
 .verdict { min-width:86px; font-weight:650; }
 .verdict.good.active { background:var(--good); color:white; border-color:var(--good); }
 .verdict.bad.active { background:var(--bad); color:white; border-color:var(--bad); }
-.verdict.unsure.active { background:var(--warn); color:white; border-color:var(--warn); }
+.verdict.compare.active { background:var(--accent); color:white; border-color:var(--accent); }
 textarea { width:100%; min-height:64px; margin-top:10px; resize:vertical; border:1px solid var(--line);
   border-radius:6px; background:var(--surface); color:var(--ink); padding:8px; }
 .error { margin:10px 0; color:var(--bad); }
@@ -864,7 +864,31 @@ let position = 0;
 
 const $ = id => document.getElementById(id);
 
-function annotationFor(c) { return annotations[c.id] || {verdict:'', note:''}; }
+function annotationFor(c) {
+  const raw = annotations[c.id];
+  if (!raw || typeof raw !== 'object') {
+    return {prediction_verdict:'', gemini_verdict:'', better_than_gemini:false, note:''};
+  }
+  // Older reports stored the local-model judgment in `verdict`.
+  const legacy = ['correct','incorrect'].includes(raw.verdict) ? raw.verdict : '';
+  return {...raw,
+    prediction_verdict:['correct','incorrect'].includes(raw.prediction_verdict)
+      ? raw.prediction_verdict : legacy,
+    gemini_verdict:['correct','incorrect'].includes(raw.gemini_verdict)
+      ? raw.gemini_verdict : '',
+    better_than_gemini:raw.better_than_gemini === true,
+    note:typeof raw.note === 'string' ? raw.note : ''};
+}
+function isComplete(a) { return !!a.prediction_verdict && !!a.gemini_verdict; }
+function storeAnnotation(c, value) {
+  const next = {...value};
+  delete next.verdict;
+  if (!next.better_than_gemini) delete next.better_than_gemini;
+  next.updated_at = new Date().toISOString();
+  if (next.prediction_verdict || next.gemini_verdict || next.better_than_gemini || next.note) {
+    annotations[c.id] = next;
+  } else delete annotations[c.id];
+}
 function save() {
   try { localStorage.setItem(stateKey, JSON.stringify(annotations)); } catch (_) {}
   updateStats();
@@ -873,22 +897,35 @@ function selectedCase() { return visible.length ? CASES[visible[position]] : nul
 
 function computeStats(source='') {
   const rows = source ? CASES.filter(c => c.source === source) : CASES;
-  let correct=0, incorrect=0, uncertain=0;
+  let predictionCorrect=0, predictionIncorrect=0;
+  let geminiCorrect=0, geminiIncorrect=0, comparable=0, better=0;
   rows.forEach(c => {
-    const v = annotationFor(c).verdict;
-    if (v === 'correct') correct++;
-    else if (v === 'incorrect') incorrect++;
-    else if (v === 'uncertain') uncertain++;
+    const a = annotationFor(c);
+    if (a.prediction_verdict === 'correct') predictionCorrect++;
+    else if (a.prediction_verdict === 'incorrect') predictionIncorrect++;
+    if (a.gemini_verdict === 'correct') geminiCorrect++;
+    else if (a.gemini_verdict === 'incorrect') geminiIncorrect++;
+    if (isComplete(a)) {
+      comparable++;
+      if (a.better_than_gemini) better++;
+    }
   });
-  const decided = correct + incorrect;
-  return {total:rows.length, correct, incorrect, uncertain,
-    labeled:correct+incorrect+uncertain, accuracy:decided ? correct/decided : null};
+  const predictionLabeled = predictionCorrect + predictionIncorrect;
+  const geminiLabeled = geminiCorrect + geminiIncorrect;
+  return {total:rows.length, predictionCorrect, predictionIncorrect, predictionLabeled,
+    predictionAccuracy:predictionLabeled ? predictionCorrect/predictionLabeled : null,
+    geminiCorrect, geminiIncorrect, geminiLabeled,
+    geminiAccuracy:geminiLabeled ? geminiCorrect/geminiLabeled : null,
+    comparable, better, betterRate:comparable ? better/comparable : null};
 }
 function fmtStats(label, s) {
-  const acc = s.accuracy === null ? 'n/a' : `${(100*s.accuracy).toFixed(1)}%`;
-  return `<span class="stat"><b>${label}</b> ${s.labeled}/${s.total} 已标 · `+
-    `<span style="color:var(--good)">${s.correct} 对</span> · `+
-    `<span style="color:var(--bad)">${s.incorrect} 错</span> · 正确率 <b>${acc}</b></span>`;
+  const predictionAcc = s.predictionAccuracy === null ? 'n/a' : `${(100*s.predictionAccuracy).toFixed(1)}%`;
+  const geminiAcc = s.geminiAccuracy === null ? 'n/a' : `${(100*s.geminiAccuracy).toFixed(1)}%`;
+  const betterRate = s.betterRate === null ? 'n/a' : `${(100*s.betterRate).toFixed(1)}%`;
+  return `<span class="stat"><b>${escapeHtml(label)}</b> `+
+    `预测 <b>${predictionAcc}</b> (${s.predictionCorrect}/${s.predictionLabeled}) · `+
+    `Gemini <b>${geminiAcc}</b> (${s.geminiCorrect}/${s.geminiLabeled}) · `+
+    `优于 Gemini <b>${betterRate}</b> (${s.better}/${s.comparable})</span>`;
 }
 function updateStats() {
   const parts = [fmtStats('总体', computeStats())];
@@ -902,8 +939,17 @@ function applyFilters(keepCurrent=true) {
   const status = $('statusFilter').value;
   visible = [];
   CASES.forEach((c, index) => {
-    const verdict = annotationFor(c).verdict || 'unlabeled';
-    if ((!source || c.source === source) && (!status || verdict === status)) visible.push(index);
+    const a = annotationFor(c);
+    const matchesStatus = !status
+      || (status === 'unlabeled' && !isComplete(a))
+      || (status === 'completed' && isComplete(a))
+      || (status === 'prediction_correct' && a.prediction_verdict === 'correct')
+      || (status === 'prediction_incorrect' && a.prediction_verdict === 'incorrect')
+      || (status === 'gemini_correct' && a.gemini_verdict === 'correct')
+      || (status === 'gemini_incorrect' && a.gemini_verdict === 'incorrect')
+      || (status === 'better' && isComplete(a) && a.better_than_gemini)
+      || (status === 'not_better' && isComplete(a) && !a.better_than_gemini);
+    if ((!source || c.source === source) && matchesStatus) visible.push(index);
   });
   if (current) {
     const found = visible.findIndex(index => CASES[index].id === current.id);
@@ -949,20 +995,22 @@ function render() {
     `${c.gemini || c.gemini_error ? '<div class="panel"><h2>Gemini（仅 answer + summary）</h2><pre id="gemini"></pre></div>' : ''}</div>
     <div class="score-grid">${scorePanel('本地模型奖励',c.local_scores)}${scorePanel('Gemini 奖励',c.gemini_scores)}</div>
     <div class="annotation"><div class="verdicts">
-      <button class="verdict good ${a.verdict==='correct'?'active':''}" data-v="correct">正确 <span class="kbd">1</span></button>
-      <button class="verdict bad ${a.verdict==='incorrect'?'active':''}" data-v="incorrect">错误 <span class="kbd">2</span></button>
-      <button class="verdict unsure ${a.verdict==='uncertain'?'active':''}" data-v="uncertain">不确定 <span class="kbd">3</span></button>
-      <button class="verdict" data-v="">清除</button>
+      <button class="verdict good ${a.prediction_verdict==='correct'?'active':''}" data-field="prediction_verdict" data-v="correct">预测正确 <span class="kbd">1</span></button>
+      <button class="verdict bad ${a.prediction_verdict==='incorrect'?'active':''}" data-field="prediction_verdict" data-v="incorrect">预测错误 <span class="kbd">2</span></button>
+      <button class="verdict good ${a.gemini_verdict==='correct'?'active':''}" data-field="gemini_verdict" data-v="correct">Gemini 正确 <span class="kbd">3</span></button>
+      <button class="verdict bad ${a.gemini_verdict==='incorrect'?'active':''}" data-field="gemini_verdict" data-v="incorrect">Gemini 错误 <span class="kbd">4</span></button>
+      <button class="verdict compare ${a.better_than_gemini?'active':''}" id="better" type="button">预测比 Gemini 好 <span class="kbd">5</span></button>
     </div><textarea id="note" placeholder="备注（自动保存在当前浏览器）"></textarea></div>`;
   $('gt').textContent = c.gt_display;
   $('pred').textContent = c.pred_display;
   if ($('gemini')) $('gemini').textContent = c.gemini;
   $('note').value = a.note || '';
-  document.querySelectorAll('[data-v]').forEach(button => button.onclick = () => setVerdict(button.dataset.v));
+  document.querySelectorAll('[data-field]').forEach(button => button.onclick = () =>
+    setJudgment(button.dataset.field, button.dataset.v));
+  $('better').onclick = toggleBetter;
   $('note').oninput = event => {
     const old = annotationFor(c);
-    annotations[c.id] = {...old, note:event.target.value, updated_at:new Date().toISOString()};
-    if (!annotations[c.id].verdict && !annotations[c.id].note) delete annotations[c.id];
+    storeAnnotation(c, {...old, note:event.target.value});
     save();
   };
 }
@@ -970,15 +1018,22 @@ function render() {
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 }
-function setVerdict(verdict) {
+function setJudgment(field, verdict) {
   const c = selectedCase();
   if (!c) return;
   const old = annotationFor(c);
-  if (verdict || old.note) annotations[c.id] = {...old, verdict, updated_at:new Date().toISOString()};
-  else delete annotations[c.id];
+  const next = {...old, [field]:old[field] === verdict ? '' : verdict};
+  storeAnnotation(c, next);
   save();
-  if ($('autoNext').checked && verdict && position < visible.length-1) position++;
+  if ($('autoNext').checked && !isComplete(old) && isComplete(next) && position < visible.length-1) position++;
   applyFilters(true);
+}
+function toggleBetter() {
+  const c = selectedCase();
+  if (!c) return;
+  const old = annotationFor(c);
+  storeAnnotation(c, {...old, better_than_gemini:!old.better_than_gemini});
+  save(); render();
 }
 function move(delta) {
   position = Math.max(0, Math.min(visible.length-1, position+delta));
@@ -988,14 +1043,18 @@ function nextUnlabeled() {
   const start = visible.length ? position+1 : 0;
   for (let i=0; i<visible.length; i++) {
     const p = (start+i) % visible.length;
-    if (!annotationFor(CASES[visible[p]]).verdict) { position=p; render(); return; }
+    if (!isComplete(annotationFor(CASES[visible[p]]))) { position=p; render(); return; }
   }
-  alert('当前筛选范围内没有未标注 case');
+  alert('当前筛选范围内没有未完成 case');
 }
 function exportJsonl() {
   const lines = CASES.map(c => JSON.stringify({
     id:c.id, source:c.source, jsonl_line:c.jsonl_line, source_file:c.source_file,
-    source_row:c.source_row, verdict:annotationFor(c).verdict || '',
+    source_row:c.source_row,
+    verdict:annotationFor(c).prediction_verdict || '',
+    prediction_verdict:annotationFor(c).prediction_verdict || '',
+    gemini_verdict:annotationFor(c).gemini_verdict || '',
+    better_than_gemini:annotationFor(c).better_than_gemini === true,
     note:annotationFor(c).note || '', updated_at:annotationFor(c).updated_at || '',
     data_source:c.data_source, ground_truth:c.gt, prediction:c.pred,
     gemini_prediction:c.gemini, local_scores:c.local_scores,
@@ -1016,9 +1075,16 @@ async function importJsonl(file) {
     try {
       const row=JSON.parse(line);
       if (!valid.has(row.id)) continue;
-      const verdict=['correct','incorrect','uncertain'].includes(row.verdict) ? row.verdict : '';
+      const legacy=['correct','incorrect'].includes(row.verdict) ? row.verdict : '';
+      const predictionVerdict=['correct','incorrect'].includes(row.prediction_verdict)
+        ? row.prediction_verdict : legacy;
+      const geminiVerdict=['correct','incorrect'].includes(row.gemini_verdict) ? row.gemini_verdict : '';
+      const betterThanGemini=row.better_than_gemini === true;
       const note=typeof row.note==='string' ? row.note : '';
-      if (verdict || note) annotations[row.id]={verdict,note,updated_at:row.updated_at||new Date().toISOString()};
+      if (predictionVerdict || geminiVerdict || betterThanGemini || note) annotations[row.id]={
+        prediction_verdict:predictionVerdict, gemini_verdict:geminiVerdict,
+        better_than_gemini:betterThanGemini, note,
+        updated_at:row.updated_at||new Date().toISOString()};
       else delete annotations[row.id];
       imported++;
     } catch (_) {}
@@ -1037,9 +1103,11 @@ document.addEventListener('keydown', event => {
   if (event.target.matches('textarea,input,select')) return;
   if (event.key==='ArrowLeft') move(-1);
   else if (event.key==='ArrowRight') move(1);
-  else if (event.key==='1') setVerdict('correct');
-  else if (event.key==='2') setVerdict('incorrect');
-  else if (event.key==='3') setVerdict('uncertain');
+  else if (event.key==='1') setJudgment('prediction_verdict','correct');
+  else if (event.key==='2') setJudgment('prediction_verdict','incorrect');
+  else if (event.key==='3') setJudgment('gemini_verdict','correct');
+  else if (event.key==='4') setJudgment('gemini_verdict','incorrect');
+  else if (event.key==='5') toggleBetter();
 });
 
 REPORT.sources.forEach(source => {
@@ -1130,17 +1198,20 @@ def build_html(
   <div id="stats" class="stats"></div>
   <div class="controls">
     <select id="sourceFilter"><option value="">全部数据</option></select>
-    <select id="statusFilter"><option value="">全部状态</option><option value="unlabeled">未标注</option>
-      <option value="correct">正确</option><option value="incorrect">错误</option><option value="uncertain">不确定</option></select>
+    <select id="statusFilter"><option value="">全部状态</option><option value="unlabeled">未完成</option>
+      <option value="completed">已完成</option><option value="prediction_correct">预测正确</option>
+      <option value="prediction_incorrect">预测错误</option><option value="gemini_correct">Gemini 正确</option>
+      <option value="gemini_incorrect">Gemini 错误</option><option value="better">预测更好</option>
+      <option value="not_better">预测未更好</option></select>
     <button id="prev">← 上一个</button><button id="next">下一个 →</button>
-    <button id="nextUnlabeled">下一个未标注</button>
-    <label><input id="autoNext" type="checkbox" checked> 标注后自动前进</label>
+    <button id="nextUnlabeled">下一个未完成</button>
+    <label><input id="autoNext" type="checkbox"> 两项正确性判断后自动前进</label>
     <span class="grow"></span><button id="export" class="primary">导出 JSONL</button>
     <label><input id="import" type="file" accept=".jsonl,application/x-ndjson" hidden>
       <span role="button" style="display:inline-block;border:1px solid var(--line);border-radius:6px;padding:7px 10px;cursor:pointer">导入标注</span></label>
   </div>
 </div></header><main class="main"><section id="case" class="case"></section>
-<p class="muted">标注保存在当前浏览器 localStorage。正确率分母仅含“正确 + 错误”，“不确定”不计入。</p>
+<p class="muted">标注保存在当前浏览器 localStorage。预测与 Gemini 正确率分别按各自已判断样本计算；“优于 Gemini”按两项正确性均已判断的样本计算，未勾选视为否。再次点击已选按钮可取消。</p>
 </main><script>const REPORT={_safe_script_json(report)};const CASES={_safe_script_json(payload)};{JS}</script>
 </body></html>"""
     out_path.write_text(document, encoding="utf-8")

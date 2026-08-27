@@ -1,4 +1,6 @@
 import sys
+import tempfile
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -108,6 +110,42 @@ class HtmlArrowLabelFilterTest(unittest.TestCase):
 
         self.assertIn("old (1, 0, -1)", filtered)
         self.assertNotIn("new (0, 1, -1)", filtered)
+
+
+class HtmlAnnotationControlsTest(unittest.TestCase):
+    def test_has_five_comparison_keys_and_three_metrics(self):
+        case = annotation.Case(
+            order=0,
+            jsonl_line=1,
+            source="dataset",
+            source_path=Path("source.jsonl"),
+            source_row=0,
+            ground_truth='{"boxes":[]}',
+            prediction='{"boxes":[]}',
+            image_paths=[],
+            gemini_prediction="answer",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "index.html"
+            annotation.build_html(
+                [case], Path("rollout.jsonl"), "1", output, sources=["dataset"]
+            )
+            document = output.read_text(encoding="utf-8")
+
+        for label in (
+            "预测正确",
+            "预测错误",
+            "Gemini 正确",
+            "Gemini 错误",
+            "预测比 Gemini 好",
+        ):
+            self.assertIn(label, document)
+        for key in ("predictionAccuracy", "geminiAccuracy", "betterRate"):
+            self.assertIn(key, document)
+        self.assertIn("prediction_verdict", document)
+        self.assertIn("gemini_verdict", document)
+        self.assertIn("better_than_gemini", document)
+        self.assertNotIn("不确定 <span class=\"kbd\">", document)
 
 
 if __name__ == "__main__":
