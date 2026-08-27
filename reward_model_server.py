@@ -149,6 +149,7 @@ class DynamicBatcher:
 class ServerState:
     def __init__(self):
         self.batcher: Optional[DynamicBatcher] = None
+        self.backend: Optional[str] = None
         self.ready = False
         self.fatal_error: Optional[BaseException] = None
         self.lock = threading.Lock()
@@ -174,10 +175,11 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
         with self.server.state.lock:
             ready = self.server.state.ready
             fatal_error = self.server.state.fatal_error
+            backend = self.server.state.backend
         if fatal_error is not None:
             self._send_json(500, {"status": "fatal", "error": str(fatal_error)})
         elif ready:
-            self._send_json(200, {"status": "ok"})
+            self._send_json(200, {"status": "ok", "backend": backend})
         else:
             self._send_json(503, {"status": "loading"})
 
@@ -241,7 +243,26 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
-    # 每对 summary 对应一个四分类 prompt；默认一次送入 vLLM 100 条。
+    parser.add_argument(
+        "--backend",
+        choices=("auto", "vllm", "transformers"),
+        default="auto",
+        help="R4 后端；auto 优先 vLLM，不可用时回退 Transformers",
+    )
+    parser.add_argument(
+        "--model-path",
+        default=None,
+        help=(
+            "奖励模型目录；默认使用 R4_MODEL_LOCAL_PATH，未配置时使用 "
+            "R4_MODEL_NAME"
+        ),
+    )
+    parser.add_argument(
+        "--transformers-device",
+        default="auto",
+        help="Transformers 设备，如 auto、cuda、cuda:0 或 cpu",
+    )
+    # 每对 summary 对应一个四分类 prompt；默认一次送入后端 100 条。
     parser.add_argument("--max-batch-size", type=int, default=100)
     parser.add_argument("--max-wait-ms", type=float, default=20.0)
     parser.add_argument("--log-level", default="INFO")
@@ -287,13 +308,21 @@ def run_server(args) -> int:
 
     batcher = None
     model = None
+    backend = None
     try:
         LOGGER.info("Loading R4 reward model before accepting score requests")
-        # 延迟导入，确保模块导入和 DynamicBatcher 单元测试不要求 vLLM。
-        # 正式服务启动时导入/加载失败仍会立即非零退出。
-        from reward_model import get_reward_model
+        # 延迟导入，确保模块导入和 DynamicBatcher 单元测试不要求任何
+        # 模型依赖。auto 在 Windows 或 vLLM 无法导入时使用 Transformers。
+        import reward_model as reward_model_module
+        from reward_model_transformers import create_reward_model
 
-        model = get_reward_model()
+        model, backend = create_reward_model(
+            reward_model_module,
+            model_path=getattr(args, "model_path", None),
+            backend=getattr(args, "backend", "auto"),
+            device=getattr(args, "transformers_device", "auto"),
+        )
+        LOGGER.info("Selected R4 backend: %s", backend)
         model.load()
         batcher = DynamicBatcher(
             model.score_summaries,
@@ -304,12 +333,14 @@ def run_server(args) -> int:
         batcher.start()
         with state.lock:
             state.batcher = batcher
+            state.backend = backend
             state.ready = True
         LOGGER.info(
             "R4 reward service ready at http://%s:%d "
-            "(max_batch_size=%d, max_wait_ms=%s)",
+            "(backend=%s, max_batch_size=%d, max_wait_ms=%s)",
             args.host,
             args.port,
+            backend,
             args.max_batch_size,
             args.max_wait_ms,
         )
@@ -324,7 +355,7 @@ def run_server(args) -> int:
         if batcher is not None:
             batcher.close()
         if model is not None:
-            LOGGER.info("Shutting down R4 vLLM engine")
+            LOGGER.info("Shutting down R4 %s backend", backend or "model")
             model.close()
         server.server_close()
         server_thread.join(timeout=5)

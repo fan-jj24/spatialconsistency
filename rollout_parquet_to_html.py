@@ -759,11 +759,18 @@ def reward_server_for_scoring(args: argparse.Namespace):
         host,
         "--port",
         str(args.reward_port),
+        "--backend",
+        getattr(args, "reward_backend", "auto"),
+        "--transformers-device",
+        getattr(args, "reward_transformers_device", "auto"),
         "--max-batch-size",
         str(args.reward_max_batch_size),
         "--max-wait-ms",
         str(args.reward_max_wait_ms),
     ]
+    reward_model_path = getattr(args, "reward_model_path", None)
+    if reward_model_path:
+        command.extend(["--model-path", reward_model_path])
     print(f"rollout 已完成，启动 reward model: {base_url}")
     popen_kwargs = {"cwd": str(server_script.parent)}
     if sys.platform == "win32":
@@ -1050,6 +1057,22 @@ def parse_args() -> argparse.Namespace:
                         help="自动 reward service 监听地址，默认 127.0.0.1")
     parser.add_argument("--reward_port", "--reward-port", type=int, default=8765,
                         help="自动 reward service 端口，默认 8765")
+    parser.add_argument(
+        "--reward_backend", "--reward-backend",
+        choices=("auto", "vllm", "transformers"),
+        default="auto",
+        help="R4 后端；auto 优先 vLLM，不可用时回退 Transformers",
+    )
+    parser.add_argument(
+        "--reward_model_path", "--reward-model-path",
+        default=None,
+        help="R4 奖励模型目录；默认读取 R4_MODEL_LOCAL_PATH",
+    )
+    parser.add_argument(
+        "--reward_transformers_device", "--reward-transformers-device",
+        default="auto",
+        help="Transformers 回退设备，如 auto、cuda、cuda:0 或 cpu",
+    )
     parser.add_argument(
         "--reward_start_timeout", "--reward-start-timeout",
         type=float,
