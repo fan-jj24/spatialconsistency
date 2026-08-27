@@ -28,7 +28,7 @@ from __future__ import annotations
 import argparse
 import base64
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import html as html_mod
 import io
@@ -278,6 +278,12 @@ class Case:
     prediction: str
     image_paths: list[str]
     image_error: str = ""
+    data_source: str = ""
+    gemini_prediction: str = ""
+    local_scores: dict[str, float] = field(default_factory=dict)
+    gemini_scores: dict[str, float] = field(default_factory=dict)
+    evaluation_error: str = ""
+    gemini_error: str = ""
 
     @property
     def case_id(self) -> str:
@@ -650,7 +656,12 @@ button.primary { background:var(--accent); color:white; border-color:var(--accen
 .legend { margin:10px 0; color:var(--muted); font-size:12px; }
 .swatch { display:inline-block; width:18px; height:3px; vertical-align:3px; margin:0 4px 0 10px; }
 .swatch:first-child { margin-left:0; }
-.text-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:12px; }
+.text-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(360px,100%),1fr)); gap:12px; margin-top:12px; }
+.score-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(300px,100%),1fr)); gap:12px; margin-top:12px; }
+.score-panel { border:1px solid var(--line); border-radius:6px; padding:10px; background:var(--bg); }
+.score-panel h2 { font-size:13px; margin:0 0 8px; }
+.score-items { display:flex; flex-wrap:wrap; gap:7px; }
+.score { border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-variant-numeric:tabular-nums; }
 .panel { min-width:0; }
 .panel h2 { font-size:13px; margin:0 0 5px; }
 pre { margin:0; padding:10px; min-height:110px; max-height:300px; overflow:auto;
@@ -732,6 +743,15 @@ function applyFilters(keepCurrent=true) {
   render();
 }
 
+function scorePanel(title, scores) {
+  const entries = Object.entries(scores || {});
+  if (!entries.length) return '';
+  const labels = {reward:'总奖励'};
+  return `<div class="score-panel"><h2>${escapeHtml(title)}</h2><div class="score-items">`+
+    entries.map(([name,value]) => `<span class="score"><b>${escapeHtml(labels[name] || name)}</b> ${Number(value).toFixed(4)}</span>`).join('')+
+    `</div></div>`;
+}
+
 function render() {
   $('count').textContent = visible.length ? `${position+1} / ${visible.length}` : '0 / 0';
   $('prev').disabled = position <= 0;
@@ -747,13 +767,18 @@ function render() {
     `<img src="${src}" alt="case ${c.order} image ${i+1}"></div>`).join('') : '';
   $('case').innerHTML = `
     <div class="meta"><b class="mono">${escapeHtml(REPORT.row_label)} #${c.jsonl_line}</b><span>${escapeHtml(c.source)}</span>`+
-    `<span>${escapeHtml(c.source_file)} row ${c.source_row}</span></div>
+    `<span>${escapeHtml(c.source_file)} row ${c.source_row}</span>`+
+    `${c.data_source ? `<span>${escapeHtml(c.data_source)}</span>` : ''}</div>
     ${c.image_error ? `<div class="error">${escapeHtml(c.image_error)}</div>` : ''}
+    ${c.evaluation_error ? `<div class="error">奖励计算失败：${escapeHtml(c.evaluation_error)}</div>` : ''}
+    ${c.gemini_error ? `<div class="error">Gemini 失败：${escapeHtml(c.gemini_error)}</div>` : ''}
     <div class="images">${imageHtml || '<div class="empty">无可用图片</div>'}</div>
     <div class="legend"><span class="swatch" style="background:#e12d2d"></span>GT：红色实线 `+
-    `<span class="swatch" style="background:#2364e1"></span>预测：蓝色虚线（全部独立绘制，不做匹配）</div>
+    `<span class="swatch" style="background:#2364e1"></span>${REPORT.comparison ? '本地模型预测：蓝色虚线（Gemini 不绘框）' : '预测：蓝色虚线（全部独立绘制，不做匹配）'}</div>
     <div class="text-grid"><div class="panel"><h2>GT</h2><pre id="gt"></pre></div>`+
-    `<div class="panel"><h2>预测</h2><pre id="pred"></pre></div></div>
+    `<div class="panel"><h2>${REPORT.comparison ? '本地模型预测' : '预测'}</h2><pre id="pred"></pre></div>`+
+    `${c.gemini || c.gemini_error ? '<div class="panel"><h2>Gemini（仅 answer + summary）</h2><pre id="gemini"></pre></div>' : ''}</div>
+    <div class="score-grid">${scorePanel('本地模型奖励',c.local_scores)}${scorePanel('Gemini 奖励',c.gemini_scores)}</div>
     <div class="annotation"><div class="verdicts">
       <button class="verdict good ${a.verdict==='correct'?'active':''}" data-v="correct">正确 <span class="kbd">1</span></button>
       <button class="verdict bad ${a.verdict==='incorrect'?'active':''}" data-v="incorrect">错误 <span class="kbd">2</span></button>
@@ -762,6 +787,7 @@ function render() {
     </div><textarea id="note" placeholder="备注（自动保存在当前浏览器）"></textarea></div>`;
   $('gt').textContent = c.gt;
   $('pred').textContent = c.pred;
+  if ($('gemini')) $('gemini').textContent = c.gemini;
   $('note').value = a.note || '';
   document.querySelectorAll('[data-v]').forEach(button => button.onclick = () => setVerdict(button.dataset.v));
   $('note').oninput = event => {
@@ -802,7 +828,10 @@ function exportJsonl() {
     id:c.id, source:c.source, jsonl_line:c.jsonl_line, source_file:c.source_file,
     source_row:c.source_row, verdict:annotationFor(c).verdict || '',
     note:annotationFor(c).note || '', updated_at:annotationFor(c).updated_at || '',
-    ground_truth:c.gt, prediction:c.pred
+    data_source:c.data_source, ground_truth:c.gt, prediction:c.pred,
+    gemini_prediction:c.gemini, local_scores:c.local_scores,
+    gemini_scores:c.gemini_scores, evaluation_error:c.evaluation_error,
+    gemini_error:c.gemini_error
   }));
   const blob = new Blob([lines.join('\n')+'\n'], {type:'application/x-ndjson;charset=utf-8'});
   const url = URL.createObjectURL(blob), a = document.createElement('a');
@@ -878,6 +907,9 @@ def build_html(
         digest.update(case.case_id.encode())
         digest.update(case.ground_truth.encode())
         digest.update(case.prediction.encode())
+        digest.update(case.gemini_prediction.encode())
+        digest.update(_safe_script_json(case.local_scores).encode())
+        digest.update(_safe_script_json(case.gemini_scores).encode())
     report_sources = list(sources) if sources is not None else list(TARGET_SOURCES)
     page_title = title or f"Step {step} 人工正确率标注"
     report = {
@@ -888,6 +920,13 @@ def build_html(
         "count": len(cases),
         "row_label": row_label,
         "export_filename": export_filename or f"annotations_step_{step}.jsonl",
+        "comparison": any(
+            case.gemini_prediction
+            or case.gemini_error
+            or case.local_scores
+            or case.gemini_scores
+            for case in cases
+        ),
     }
     payload = [{
         "id": case.case_id,
@@ -898,6 +937,12 @@ def build_html(
         "source_row": case.source_row,
         "gt": case.ground_truth,
         "pred": case.prediction,
+        "gemini": case.gemini_prediction,
+        "data_source": case.data_source,
+        "local_scores": case.local_scores,
+        "gemini_scores": case.gemini_scores,
+        "evaluation_error": case.evaluation_error,
+        "gemini_error": case.gemini_error,
         "images": case.image_paths,
         "image_error": case.image_error,
     } for case in cases]
@@ -911,7 +956,7 @@ def build_html(
     <span class="grow"></span><span id="count" class="mono"></span></div>
   <div id="stats" class="stats"></div>
   <div class="controls">
-    <select id="sourceFilter"><option value="">两个数据集</option></select>
+    <select id="sourceFilter"><option value="">全部数据</option></select>
     <select id="statusFilter"><option value="">全部状态</option><option value="unlabeled">未标注</option>
       <option value="correct">正确</option><option value="incorrect">错误</option><option value="uncertain">不确定</option></select>
     <button id="prev">← 上一个</button><button id="next">下一个 →</button>

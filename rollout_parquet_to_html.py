@@ -1,36 +1,66 @@
 #!/usr/bin/env python3
-r"""Run a reward-free Transformers rollout on Parquet rows and build an HTML report.
+r"""Run local/Gemini rollouts on Parquet rows, score them, and build HTML.
 
 This script is intended for a Windows workstation with one CUDA GPU.  It reads
-one VERL Parquet shard directly, selects 200 rows by default, generates one
-response per row with the supplied local Hugging Face model, and reuses the
-interactive human-accuracy page from ``annotate_val_cases.py``.  It never loads
-or calls the reward code/model.
+one VERL ``train.parquet`` through the same Hugging Face ``datasets`` loader
+used by VERL, selects 200 rows by default, generates one
+full response with the supplied local Hugging Face model and an answer/summary
+response with Gemini, then calculates reward details and reuses the interactive
+human-accuracy page from ``annotate_val_cases.py``.
 
 Example (PowerShell, one line)::
 
-    python rollout_parquet_to_html.py --model_path D:\models\Qwen_RL --data_path D:\RL1\inconsistent_cot_verl_2500\train_0000.parquet --out_dir D:\eval\train0000_200
+    python rollout_parquet_to_html.py --model_path D:\models\Qwen_RL \
+      --data_path D:\RL1\train.parquet --num_samples 200 \
+      --out_dir D:\eval\train_200
 
 Dependencies::
 
-    pip install torch torchvision transformers accelerate pyarrow pillow
+    pip install torch torchvision transformers accelerate datasets pyarrow pillow requests oss2
 
-Generation results are appended to ``rollout_results.jsonl`` after every
-batch.  If a run is interrupted, repeat the command with ``--resume``.
+Local and Gemini results are checkpointed separately.  If a run is interrupted,
+repeat the command with ``--resume``.
+
+Gemini requires ``IDEALAB_API_KEY`` plus the four ``OUTER_OSS_*`` variables
+used by ``run_gemini.py``.  Summary reward R4 uses ``R4_REWARD_URL`` (default
+``http://127.0.0.1:8765``), so start ``reward_model_server.py`` first or point
+the variable at an existing reward service.
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
 import json
+import os
 import random
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import annotate_val_cases as annotation
+import json_answer_reward as reward
+
+
+GEMINI_MODEL = "gemini-3.5-flash"
+# 本脚本只用于 inconsistent CoT 数据。两路使用独立的固定标识：
+# 本地路由计算 C/R2/R3/R4/reward，Gemini 路由只计算 C/R4。
+LOCAL_DATA_SOURCE = reward.INCONSISTENT_COT_LOCAL_EVAL_SOURCE
+GEMINI_DATA_SOURCE = reward.INCONSISTENT_COT_GEMINI_EVAL_SOURCE
+
+
+def _gemini_module():
+    """Load optional Gemini/OSS dependencies only when Gemini is enabled."""
+    try:
+        import run_gemini
+    except ImportError as exc:
+        raise RuntimeError(
+            "Gemini 调用需要 requests 和 oss2：pip install requests oss2"
+        ) from exc
+    return run_gemini
 
 
 @dataclass
@@ -39,16 +69,25 @@ class EvalRow:
     source_row: int
     row: dict[str, Any]
     ground_truth: str
+    local_data_source: str
+    gemini_data_source: str
     prediction: str = ""
     generation_error: str = ""
+    gemini_prediction: str = ""
+    gemini_error: str = ""
+    local_scores: dict[str, float] | None = None
+    gemini_scores: dict[str, float] | None = None
+    evaluation_error: str = ""
 
 
-def _require_pyarrow():
+def _require_datasets():
     try:
-        import pyarrow.parquet as pq
+        import datasets
     except ImportError as exc:
-        raise RuntimeError("读取 Parquet 需要 pyarrow：pip install pyarrow") from exc
-    return pq
+        raise RuntimeError(
+            "按 VERL 方式读取 Parquet 需要 datasets：pip install datasets pyarrow"
+        ) from exc
+    return datasets
 
 
 def select_indices(
@@ -58,6 +97,8 @@ def select_indices(
     seed: int,
     start_row: int,
 ) -> list[int]:
+    if total <= 0:
+        raise ValueError("train.parquet 为空")
     if start_row < 0 or start_row >= total:
         raise ValueError(f"--start_row 必须在 0 到 {total - 1} 之间")
     available = total - start_row
@@ -72,31 +113,6 @@ def select_indices(
     return sorted(random.Random(seed).sample(population, count))
 
 
-def _read_selected_row_groups(
-    parquet_file,
-    indices: Iterable[int],
-    columns: list[str],
-) -> dict[int, dict[str, Any]]:
-    wanted = set(indices)
-    result: dict[int, dict[str, Any]] = {}
-    offset = 0
-    for group_index in range(parquet_file.num_row_groups):
-        count = parquet_file.metadata.row_group(group_index).num_rows
-        in_group = sorted(index for index in wanted if offset <= index < offset + count)
-        if in_group:
-            rows = parquet_file.read_row_group(group_index, columns=columns).to_pylist()
-            for index in in_group:
-                value = rows[index - offset]
-                if not isinstance(value, dict):
-                    raise TypeError(f"Parquet row {index} 不是 object")
-                result[index] = value
-        offset += count
-    missing = sorted(wanted - result.keys())
-    if missing:
-        raise RuntimeError(f"未能读取 Parquet rows: {missing[:10]}")
-    return result
-
-
 def load_eval_rows(
     data_path: Path,
     count: int,
@@ -104,29 +120,36 @@ def load_eval_rows(
     seed: int,
     start_row: int,
 ) -> tuple[list[EvalRow], int]:
-    pq = _require_pyarrow()
-    parquet_file = pq.ParquetFile(data_path)
-    total = parquet_file.metadata.num_rows
-    names = set(parquet_file.schema_arrow.names)
+    datasets = _require_datasets()
+    # Keep this call identical to VERL's RLHFDataset._read_files_and_tokenize.
+    dataframe = datasets.load_dataset("parquet", data_files=str(data_path))["train"]
+    total = len(dataframe)
+    names = set(dataframe.column_names)
     if "prompt" not in names:
         raise ValueError(f"{data_path} 缺少 VERL prompt 字段")
     if not ({"reward_model", "gts", "ground_truth", "gt"} & names):
         raise ValueError(f"{data_path} 中找不到 GT 字段")
-
     indices = select_indices(total, count, selection, seed, start_row)
-    columns = [
-        name
-        for name in ("prompt", "images", "image", "reward_model", "gts", "ground_truth", "gt")
-        if name in names
-    ]
-    selected = _read_selected_row_groups(parquet_file, indices, columns)
+    selected = dataframe.select(indices)
     rows: list[EvalRow] = []
-    for order, source_row in enumerate(indices):
-        row = selected[source_row]
+    for order, (source_row, row) in enumerate(zip(indices, selected, strict=True)):
+        if not isinstance(row, dict):
+            raise TypeError(f"Parquet row {source_row} 不是 object")
         ground_truth = annotation._json_text(annotation._ground_truth(row))
         if not ground_truth:
             raise ValueError(f"Parquet row {source_row} 的 GT 为空")
-        rows.append(EvalRow(order, source_row, row, ground_truth))
+        # 输入只包含 inconsistent CoT 数据，因此不读取或信任 Parquet 自带的
+        # data_source；本地模型和 Gemini 始终使用各自的显式评测路由。
+        rows.append(
+            EvalRow(
+                order,
+                source_row,
+                row,
+                ground_truth,
+                LOCAL_DATA_SOURCE,
+                GEMINI_DATA_SOURCE,
+            )
+        )
     return rows, total
 
 
@@ -188,6 +211,87 @@ def build_messages_and_images(
             f"prompt 使用了 {image_offset} 幅图，但 images 字段有 {len(images)} 幅"
         )
     return messages, images
+
+
+GEMINI_SYSTEM_PROMPT = """You are evaluating the same visual-spatial task as a local model.
+The role-tagged task prompt and images in the user message are the complete shared input.
+Follow that task prompt, but return only the final judgment and summary: output exactly one
+JSON object with keys \"answer\" and \"summary\". Use the answer value/format requested by
+the shared prompt. Do not output reasoning, chain-of-thought, bounding boxes, objects,
+markdown fences, or any other keys or text."""
+
+
+def build_gemini_user_content(
+    messages: list[dict[str, Any]],
+    image_urls: list[str],
+) -> list[dict[str, Any]]:
+    """Convert the exact local-model messages to idealab multimodal content."""
+    content: list[dict[str, Any]] = []
+    image_offset = 0
+    for message in messages:
+        role = str(message.get("role", "user")).upper()
+        content.append({"type": "text", "text": f"\n[{role}]\n"})
+        value = message.get("content", "")
+        items = value if isinstance(value, list) else [{"type": "text", "text": str(value)}]
+        for item in items:
+            if isinstance(item, str):
+                content.append({"type": "text", "text": item})
+            elif isinstance(item, dict) and item.get("type") == "image":
+                if image_offset >= len(image_urls):
+                    raise ValueError("Gemini prompt 的图片数量多于已上传 URL")
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": image_urls[image_offset]},
+                })
+                image_offset += 1
+            elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                content.append({"type": "text", "text": item["text"]})
+            else:
+                content.append({
+                    "type": "text",
+                    "text": json.dumps(annotation._plain(item), ensure_ascii=False),
+                })
+    if image_offset != len(image_urls):
+        raise ValueError(
+            f"Gemini prompt 使用了 {image_offset} 幅图，但上传了 {len(image_urls)} 幅"
+        )
+    content.append({
+        "type": "text",
+        "text": "\nReturn only {\"answer\": ..., \"summary\": \"...\"}.",
+    })
+    return content
+
+
+def _gemini_dataset_key(data_path: Path) -> str:
+    stat = data_path.stat()
+    fingerprint = f"{data_path}|{stat.st_size}|{stat.st_mtime_ns}"
+    return hashlib.sha256(fingerprint.encode()).hexdigest()[:16]
+
+
+def _prepare_gemini_request(
+    eval_row: EvalRow,
+    data_path: Path,
+    out_dir: Path,
+    oss_handler,
+    args: argparse.Namespace,
+) -> list[dict[str, Any]]:
+    messages, images = build_messages_and_images(eval_row.row, data_path)
+    input_dir = out_dir / "gemini_inputs" / f"row_{eval_row.source_row:08d}"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    dataset_key = _gemini_dataset_key(data_path)
+    prefix = args.gemini_oss_prefix.strip("/")
+    image_urls = []
+    for index, image in enumerate(images, 1):
+        local_path = input_dir / f"image_{index}.jpg"
+        resized = annotation._resize_image(image, args.gemini_max_image_edge)
+        annotation._save_jpeg(resized, local_path, args.jpeg_quality)
+        oss_key = (
+            f"{prefix}/{dataset_key}/row_{eval_row.source_row:08d}/image_{index}.jpg"
+        )
+        if not oss_handler.is_file_exist(oss_key):
+            oss_handler.upload_file(oss_key, str(local_path))
+        image_urls.append(oss_handler.get_oss_url(oss_key))
+    return build_gemini_user_content(messages, image_urls)
 
 
 class TransformersRollout:
@@ -321,6 +425,7 @@ def _append_checkpoint(path: Path, eval_row: EvalRow, args: argparse.Namespace) 
     payload = {
         "source_row": eval_row.source_row,
         "sample_order": eval_row.order,
+        "data_source": eval_row.local_data_source,
         "ground_truth": eval_row.ground_truth,
         "prediction": eval_row.prediction,
         "generation_error": eval_row.generation_error,
@@ -360,11 +465,13 @@ def _validate_checkpoint(
         "repetition_penalty": args.repetition_penalty,
         "max_new_tokens": args.max_new_tokens,
     }
-    selected = {row.source_row for row in rows}
+    selected = {row.source_row: row for row in rows}
     for source_row, saved in completed.items():
         if source_row not in selected:
             continue
         mismatched = [key for key, value in expected.items() if saved.get(key) != value]
+        if saved.get("data_source") != selected[source_row].local_data_source:
+            mismatched.append("data_source")
         if mismatched:
             raise ValueError(
                 f"checkpoint 中 Parquet row {source_row} 的运行参数与本次不同: "
@@ -424,31 +531,281 @@ def run_rollout(
         print(f"  rollout {completed_count}/{len(rows)}")
 
 
+def _append_gemini_checkpoint(
+    path: Path,
+    eval_row: EvalRow,
+    args: argparse.Namespace,
+) -> None:
+    payload = {
+        "source_row": eval_row.source_row,
+        "sample_order": eval_row.order,
+        "data_source": eval_row.gemini_data_source,
+        "ground_truth": eval_row.ground_truth,
+        "gemini_prediction": eval_row.gemini_prediction,
+        "gemini_error": eval_row.gemini_error,
+        "data_path": str(Path(args.data_path)),
+        "gemini_model": GEMINI_MODEL,
+        "gemini_thinking_level": args.gemini_thinking_level,
+    }
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _validate_gemini_checkpoint(
+    completed: dict[int, dict[str, Any]],
+    rows: list[EvalRow],
+    args: argparse.Namespace,
+) -> None:
+    expected = {
+        "data_path": str(Path(args.data_path)),
+        "gemini_model": GEMINI_MODEL,
+        "gemini_thinking_level": args.gemini_thinking_level,
+    }
+    selected = {row.source_row: row for row in rows}
+    for source_row, saved in completed.items():
+        if source_row not in selected:
+            continue
+        mismatched = [key for key, value in expected.items() if saved.get(key) != value]
+        if saved.get("data_source") != selected[source_row].gemini_data_source:
+            mismatched.append("data_source")
+        if mismatched:
+            raise ValueError(
+                f"Gemini checkpoint 中 Parquet row {source_row} 参数不同: "
+                f"{', '.join(mismatched)}；请恢复原参数或使用 --overwrite"
+            )
+
+
+def run_gemini_rollout(
+    rows: list[EvalRow],
+    data_path: Path,
+    out_dir: Path,
+    checkpoint_path: Path,
+    args: argparse.Namespace,
+) -> None:
+    completed = _read_checkpoint(checkpoint_path) if args.resume else {}
+    _validate_gemini_checkpoint(completed, rows, args)
+    pending: list[EvalRow] = []
+    for row in rows:
+        saved = completed.get(row.source_row)
+        if saved is not None and not (args.retry_errors and saved.get("gemini_error")):
+            row.gemini_prediction = str(saved.get("gemini_prediction", ""))
+            row.gemini_error = str(saved.get("gemini_error", ""))
+        else:
+            pending.append(row)
+    print(f"Gemini 已完成 {len(rows) - len(pending)} 条；本次需生成 {len(pending)} 条")
+    if not pending:
+        return
+
+    api_key = os.environ.get("IDEALAB_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("启用 Gemini 需要环境变量 IDEALAB_API_KEY")
+    gemini_module = _gemini_module()
+    oss_handler = gemini_module.build_outer_handler_from_env()
+    if oss_handler is None:
+        raise RuntimeError(
+            "启用 Gemini 需要 OUTER_OSS_ACCESS_KEY_ID、OUTER_OSS_ACCESS_KEY_SECRET、"
+            "OUTER_OSS_ENDPOINT、OUTER_OSS_BUCKET_NAME"
+        )
+
+    def generate_one(row: EvalRow) -> tuple[str, str]:
+        try:
+            user_content = _prepare_gemini_request(
+                row, data_path, out_dir, oss_handler, args
+            )
+            result = gemini_module.call_idealab(
+                api_key,
+                GEMINI_SYSTEM_PROMPT,
+                user_content,
+                max_retries=args.gemini_max_retries,
+                thinking_level=args.gemini_thinking_level,
+            )
+            if not result.get("ok"):
+                return "", str(result.get("error", "unknown Gemini error"))
+            prediction = str(result.get("text", "")).strip()
+            obj = reward._parse_json_obj(prediction)
+            if not isinstance(obj, dict):
+                return prediction, "Gemini 输出中找不到有效 JSON object"
+            if "answer" not in obj or not isinstance(obj.get("summary"), str):
+                return prediction, "Gemini JSON 必须包含 answer 和字符串 summary"
+            return prediction, ""
+        except Exception as exc:
+            return "", f"{type(exc).__name__}: {exc}"
+
+    completed_count = len(rows) - len(pending)
+    with ThreadPoolExecutor(max_workers=args.gemini_workers) as executor:
+        future_to_row = {executor.submit(generate_one, row): row for row in pending}
+        for future in as_completed(future_to_row):
+            row = future_to_row[future]
+            row.gemini_prediction, row.gemini_error = future.result()
+            _append_gemini_checkpoint(checkpoint_path, row, args)
+            completed_count += 1
+            if row.gemini_error:
+                print(f"  [WARN] Gemini row {row.source_row}: {row.gemini_error}")
+            print(f"  Gemini {completed_count}/{len(rows)}")
+
+
+def calculate_rewards(
+    rows: list[EvalRow],
+    args: argparse.Namespace,
+) -> None:
+    """Generate all reward details after both rollout paths have finished."""
+    jobs = []
+    for row in rows:
+        if row.prediction and not row.generation_error:
+            jobs.append((row, "local"))
+        if args.gemini and row.gemini_prediction and not row.gemini_error:
+            jobs.append((row, "gemini"))
+
+    def score_one(job):
+        row, kind = job
+        if kind == "local":
+            scores = reward.compute_score_details(
+                row.local_data_source, row.prediction, row.ground_truth
+            )
+        else:
+            scores = reward.score_answer_and_summary(
+                row.gemini_data_source, row.gemini_prediction, row.ground_truth
+            )
+        return row, kind, {key: float(value) for key, value in scores.items()}
+
+    errors: dict[int, list[str]] = {}
+    completed = 0
+    with ThreadPoolExecutor(max_workers=args.reward_workers) as executor:
+        future_to_job = {executor.submit(score_one, job): job for job in jobs}
+        for future in as_completed(future_to_job):
+            row, kind = future_to_job[future]
+            try:
+                _, _, scores = future.result()
+                if kind == "local":
+                    row.local_scores = scores
+                else:
+                    row.gemini_scores = scores
+            except Exception as exc:
+                errors.setdefault(row.source_row, []).append(
+                    f"{kind}: {type(exc).__name__}: {exc}"
+                )
+            completed += 1
+            if completed % 20 == 0 or completed == len(jobs):
+                print(f"  奖励 {completed}/{len(jobs)}")
+    for row in rows:
+        row.local_scores = row.local_scores or {}
+        row.gemini_scores = row.gemini_scores or {}
+        row.evaluation_error = "; ".join(errors.get(row.source_row, []))
+
+
+def write_evaluation_results(
+    rows: list[EvalRow],
+    path: Path,
+    args: argparse.Namespace,
+) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            payload = {
+                "source_row": row.source_row,
+                "sample_order": row.order,
+                # data_source 保留为本地路由，兼容旧的汇总结果读取方式。
+                "data_source": row.local_data_source,
+                "local_data_source": row.local_data_source,
+                "gemini_data_source": row.gemini_data_source,
+                "ground_truth": row.ground_truth,
+                "prediction": row.prediction,
+                "generation_error": row.generation_error,
+                "local_scores": row.local_scores or {},
+                "gemini_prediction": row.gemini_prediction,
+                "gemini_error": row.gemini_error,
+                "gemini_scores": row.gemini_scores or {},
+                "evaluation_error": row.evaluation_error,
+                "temperature": args.temperature,
+                "gemini_model": GEMINI_MODEL if args.gemini else None,
+            }
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def materialize_report_images(
+    rows: list[EvalRow],
+    cases: list[annotation.Case],
+    out_dir: Path,
+    max_edge: int,
+    quality: int,
+) -> None:
+    """Export images from already loaded VERL rows without source trace-back."""
+    assets_dir = out_dir / "assets"
+    fallback_count = 0
+    failed_count = 0
+    for completed, (eval_row, case) in enumerate(
+        zip(rows, cases, strict=True), 1
+    ):
+        try:
+            values = annotation._image_values(eval_row.row)
+            if not values:
+                raise ValueError("Parquet 行没有 images/image 字段")
+            images = [
+                annotation._resize_image(
+                    annotation._decode_image(value, case.source_path),
+                    max_edge,
+                )
+                for value in values
+            ]
+            target_index = 1 if len(images) >= 2 else len(images) - 1
+            if len(images) < 2:
+                fallback_count += 1
+                case.image_error = "该行不足两幅图，框已画在唯一图片上"
+            images[target_index] = annotation.annotate_second_image(
+                images[target_index],
+                annotation._extract_boxes(case.ground_truth),
+                annotation._extract_boxes(case.prediction),
+            )
+            for image_index, image in enumerate(images):
+                name = f"case_{case.order + 1:06d}_img_{image_index + 1}.jpg"
+                annotation._save_jpeg(image, assets_dir / name, quality)
+                case.image_paths.append(f"assets/{name}")
+        except Exception as exc:
+            case.image_error = f"图片处理失败: {exc}"
+            failed_count += 1
+        if completed % 100 == 0 or completed == len(cases):
+            print(f"  图片 {completed}/{len(cases)}")
+    if fallback_count:
+        print(f"  [WARN] {fallback_count} 条不足两幅图，改画在唯一图片上")
+    if failed_count:
+        print(f"  [WARN] {failed_count} 条图片处理失败；HTML 中会显示原因")
+
+
 def build_report(
     rows: list[EvalRow],
     data_path: Path,
     out_dir: Path,
     args: argparse.Namespace,
 ) -> Path:
-    source = data_path.parent.name or "parquet"
     cases = []
     for row in rows:
         prediction = row.prediction
         if row.generation_error:
             prediction = f"[生成失败]\n{row.generation_error}\n\n{prediction}".rstrip()
+        gemini_prediction = row.gemini_prediction
+        if row.gemini_error and gemini_prediction:
+            gemini_prediction = (
+                f"[输出不符合要求]\n{row.gemini_error}\n\n{gemini_prediction}"
+            ).rstrip()
         cases.append(annotation.Case(
             order=row.order,
             jsonl_line=row.source_row,
-            source=source,
+            source=row.local_data_source,
             source_path=data_path,
             source_row=row.source_row,
             ground_truth=row.ground_truth,
             prediction=prediction,
             image_paths=[],
+            data_source=row.local_data_source,
+            gemini_prediction=gemini_prediction,
+            local_scores=row.local_scores or {},
+            gemini_scores=row.gemini_scores or {},
+            evaluation_error=row.evaluation_error,
+            gemini_error=row.gemini_error if not gemini_prediction else "",
         ))
 
-    print("导出原图，并把全部 GT/预测框独立画到第二幅图...")
-    annotation.materialize_images(
+    print("导出原图，并把 GT/本地预测框独立画到第二幅图（Gemini 不绘框）...")
+    materialize_report_images(
+        rows,
         cases,
         out_dir,
         args.max_image_edge,
@@ -458,15 +815,16 @@ def build_report(
     model_name = Path(args.model_path.rstrip("/\\")).name or args.model_path
     subtitle = (
         f"模型 {model_name} · 数据 {data_path.name} · {len(rows)} 条 · "
-        f"temperature={args.temperature:g}"
+        f"temperature={args.temperature:g} · Gemini="
+        f"{GEMINI_MODEL if args.gemini else '关闭'}"
     )
     annotation.build_html(
         cases,
         data_path,
         "rollout",
         out_path,
-        title=f"{data_path.name} Rollout 人工评测",
-        sources=[source],
+        title=f"{data_path.name} 本地模型 / Gemini 对比评测",
+        sources=list(dict.fromkeys(row.local_data_source for row in rows)),
         subtitle=subtitle,
         row_label="Parquet row",
         export_filename="rollout_annotations.jsonl",
@@ -476,12 +834,12 @@ def build_report(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Windows 单卡运行 VERL Parquet rollout，并生成无奖励的交互式 HTML"
+        description="Windows 单卡并行运行本地模型/Gemini、计算奖励并生成 HTML"
     )
     parser.add_argument("--model_path", "--model-path", required=True,
                         help="本地 Hugging Face 模型目录")
     parser.add_argument("--data_path", "--data-path", required=True,
-                        help="输入 train_0000.parquet 地址")
+                        help="输入 VERL train.parquet 地址")
     parser.add_argument("--out_dir", "--out-dir", required=True,
                         help="输出目录（包含 checkpoint、assets 和 index.html）")
     parser.add_argument("--num_samples", "--num-samples", type=int, default=200,
@@ -502,8 +860,8 @@ def parse_args() -> argparse.Namespace:
                         help="与当前 VERL rollout.prompt_length 一致，默认 2048")
     parser.add_argument("--max_new_tokens", "--max-new-tokens", type=int, default=4096,
                         help="每条最大生成 token，默认 4096")
-    parser.add_argument("--temperature", type=float, default=0.0,
-                        help="默认 0（贪心），与当前 VERL 验证 rollout 一致；训练采样可设 1.0")
+    parser.add_argument("--temperature", type=float, default=0.01,
+                        help="本地模型生成温度，默认 0.01")
     parser.add_argument("--top_p", "--top-p", type=float, default=1.0,
                         help="默认 1.0，与当前 VERL rollout 一致")
     parser.add_argument("--top_k", "--top-k", type=int, default=-1,
@@ -517,6 +875,22 @@ def parse_args() -> argparse.Namespace:
                         help="允许覆盖已有 checkpoint（不删除目录内其他文件）")
     parser.add_argument("--trust_remote_code", "--trust-remote-code", action=argparse.BooleanOptionalAction,
                         default=True, help="是否允许模型仓库代码，默认开启")
+    parser.add_argument("--gemini", action=argparse.BooleanOptionalAction, default=True,
+                        help="是否并行调用 Gemini，默认开启；离线调试可用 --no-gemini")
+    parser.add_argument("--gemini_workers", "--gemini-workers", type=int, default=8,
+                        help="Gemini API 并发数，默认 8")
+    parser.add_argument("--gemini_max_retries", "--gemini-max-retries", type=int, default=3,
+                        help="Gemini 瞬态失败最大尝试次数，默认 3")
+    parser.add_argument("--gemini_thinking_level", "--gemini-thinking-level",
+                        choices=("low", "medium", "high"), default="high",
+                        help="Gemini thinking 等级，默认 high")
+    parser.add_argument("--gemini_oss_prefix", "--gemini-oss-prefix",
+                        default="spatialconsistency/rollout",
+                        help="上传 Gemini 输入图片使用的 OSS key 前缀")
+    parser.add_argument("--gemini_max_image_edge", "--gemini-max-image-edge", type=int,
+                        default=2048, help="Gemini 输入图片上传前的最长边，默认 2048")
+    parser.add_argument("--reward_workers", "--reward-workers", type=int, default=8,
+                        help="奖励计算并发数，默认 8，便于 R4 服务动态合批")
     parser.add_argument("--max_image_edge", "--max-image-edge", type=int, default=1200)
     parser.add_argument("--jpeg_quality", "--jpeg-quality", type=int, default=88)
     args = parser.parse_args()
@@ -525,6 +899,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--num_samples 必须大于 0")
     if args.batch_size <= 0:
         parser.error("--batch_size 必须大于 0")
+    if args.gemini_workers <= 0 or args.reward_workers <= 0:
+        parser.error("Gemini/reward workers 必须大于 0")
+    if args.gemini_max_retries <= 0:
+        parser.error("--gemini_max_retries 必须大于 0")
     if args.max_prompt_length <= 0 or args.max_new_tokens <= 0:
         parser.error("prompt/response 长度必须大于 0")
     if args.temperature < 0:
@@ -535,6 +913,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--repetition_penalty 必须大于 0")
     if args.max_image_edge < 128:
         parser.error("--max_image_edge 不能小于 128")
+    if args.gemini_max_image_edge < 128:
+        parser.error("--gemini_max_image_edge 不能小于 128")
+    if not args.gemini_oss_prefix.strip("/"):
+        parser.error("--gemini_oss_prefix 不能为空")
     if not 30 <= args.jpeg_quality <= 100:
         parser.error("--jpeg_quality 必须在 30 到 100 之间")
     if args.resume and args.overwrite:
@@ -552,20 +934,45 @@ def main() -> None:
     if not data_path.is_file():
         raise SystemExit(f"ERROR: Parquet 不存在: {data_path}")
     if data_path.suffix.lower() != ".parquet":
-        raise SystemExit(f"ERROR: --data_path 必须是 .parquet: {data_path}")
+        raise SystemExit(f"ERROR: --data_path 必须是 VERL .parquet 文件: {data_path}")
     if not model_path.is_dir():
         raise SystemExit(f"ERROR: 模型目录不存在: {model_path}")
     args.data_path = str(data_path)
     args.model_path = str(model_path)
     out_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = out_dir / "rollout_results.jsonl"
-    if checkpoint_path.exists() and not args.resume:
+    local_checkpoint_path = out_dir / "rollout_results.jsonl"
+    gemini_checkpoint_path = out_dir / "gemini_results.jsonl"
+    checkpoint_paths = [local_checkpoint_path]
+    if args.gemini:
+        checkpoint_paths.append(gemini_checkpoint_path)
+    existing = [path for path in checkpoint_paths if path.exists()]
+    if existing and not args.resume:
         if args.overwrite:
-            checkpoint_path.unlink()
+            for path in existing:
+                path.unlink()
         else:
             raise SystemExit(
-                f"ERROR: 已存在 {checkpoint_path}；继续请加 --resume，重跑请加 --overwrite"
+                f"ERROR: 已存在 {existing[0]}；继续请加 --resume，重跑请加 --overwrite"
             )
+    if args.gemini:
+        missing_env = [
+            name for name in (
+                "IDEALAB_API_KEY",
+                "OUTER_OSS_ACCESS_KEY_ID",
+                "OUTER_OSS_ACCESS_KEY_SECRET",
+                "OUTER_OSS_ENDPOINT",
+                "OUTER_OSS_BUCKET_NAME",
+            ) if not os.environ.get(name)
+        ]
+        if missing_env:
+            raise SystemExit(
+                "ERROR: 启用 Gemini 缺少环境变量: " + ", ".join(missing_env)
+            )
+        try:
+            if _gemini_module().build_outer_handler_from_env() is None:
+                raise RuntimeError("OSS 配置不完整")
+        except Exception as exc:
+            raise SystemExit(f"ERROR: Gemini/OSS 初始化失败: {exc}") from exc
 
     print(f"读取数据: {data_path}")
     rows, total = load_eval_rows(
@@ -579,14 +986,47 @@ def main() -> None:
         f"数据共 {total} 条；{args.selection} 抽取 {len(rows)} 条；"
         f"row 范围 {rows[0].source_row}..{rows[-1].source_row}"
     )
-    print("奖励模块：不加载；奖励计算：关闭")
-    run_rollout(rows, data_path, checkpoint_path, args)
+    if args.gemini:
+        print("本地模型与 Gemini 并行生成...")
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(
+                    run_rollout, rows, data_path, local_checkpoint_path, args
+                ),
+                executor.submit(
+                    run_gemini_rollout,
+                    rows,
+                    data_path,
+                    out_dir,
+                    gemini_checkpoint_path,
+                    args,
+                ),
+            ]
+            for future in as_completed(futures):
+                future.result()
+    else:
+        print("Gemini：关闭；运行本地模型...")
+        run_rollout(rows, data_path, local_checkpoint_path, args)
+
+    print("两路生成完成，计算每个 case 的奖励明细...")
+    calculate_rewards(rows, args)
+    evaluation_path = out_dir / "evaluation_results.jsonl"
+    write_evaluation_results(rows, evaluation_path, args)
     out_path = build_report(rows, data_path, out_dir, args)
     errors = sum(bool(row.generation_error) for row in rows)
+    gemini_errors = sum(bool(row.gemini_error) for row in rows)
+    reward_errors = sum(bool(row.evaluation_error) for row in rows)
     print(f"完成: {out_path}")
-    print(f"rollout checkpoint: {checkpoint_path}")
+    print(f"本地 checkpoint: {local_checkpoint_path}")
+    if args.gemini:
+        print(f"Gemini checkpoint: {gemini_checkpoint_path}")
+    print(f"完整结果: {evaluation_path}")
     if errors:
-        print(f"[WARN] {errors} 条生成失败；修复环境后可用 --resume --retry_errors 重试")
+        print(f"[WARN] {errors} 条本地生成失败；可用 --resume --retry_errors 重试")
+    if gemini_errors:
+        print(f"[WARN] {gemini_errors} 条 Gemini 失败；可用 --resume --retry_errors 重试")
+    if reward_errors:
+        print(f"[WARN] {reward_errors} 条奖励计算有失败，详情已写入 HTML/完整结果")
     print("人工标注保存在浏览器 localStorage；请在页面中导出 JSONL 备份。")
 
 

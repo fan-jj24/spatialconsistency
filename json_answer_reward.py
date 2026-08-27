@@ -26,7 +26,8 @@ JSON RLVR Reward Function（分类奖励框架）
               模型无法靠多输出框刷分。无匹配阈值。
 
 ━━━ 第三类: spatial_consistency_bbox 组合奖励 ━━━
-  data_source: spatial_consistency_bbox_pos / spatial_consistency_bbox_neg
+  data_source: spatial_consistency_bbox_pos / spatial_consistency_bbox_neg /
+               inconsistent_cot_local_eval（离线本地 rollout 固定路由）
   GT:          {"answer": "B", "summary": "...",
                "boxes": [{"bbox": [x1,y1,x2,y2], "label": "..."}, ...]}
                正例时 boxes 为空 []
@@ -820,9 +821,116 @@ def score_spatial_detection(solution_str, ground_truth):
     return 0.25 * r2 + 0.25 * r3 + 0.5 * r4
 
 
+def compute_score_details(data_source, solution_str, ground_truth, extra_info=None):
+    """返回与 :func:`compute_score` 一致的总分及可展示的奖励子项。
+
+    bbox 负例即使 ``C=0`` 也会计算 R2/R3/R4，便于离线报告诊断各项
+    表现；``reward`` 仍严格应用原有的 C 门控，因此与训练总奖励一致。
+    """
+    if data_source in JSON_ANSWER_SOURCES:
+        c = score_json_answer(solution_str, ground_truth)
+        return {"C": c, "reward": c}
+
+    if data_source in HUNGARIAN_IOU_SOURCES:
+        r2 = score_hungarian_iou(solution_str, ground_truth)
+        return {"R2": r2, "reward": r2}
+
+    gt_obj = _parse_json_obj(ground_truth)
+    pred_obj = _parse_json_obj(solution_str)
+    gt_entries = _parse_bbox_entries(ground_truth)
+    pred_entries = _parse_bbox_entries(solution_str)
+    matches = _hungarian_match(gt_entries, pred_entries)
+
+    if data_source in SPATIAL_CONSISTENCY_BBOX_SOURCES:
+        gt_answer = _normalize_answer(
+            gt_obj.get("answer") if isinstance(gt_obj, dict) else None
+        )
+        pred_answer = _normalize_answer(
+            pred_obj.get("answer") if isinstance(pred_obj, dict) else None
+        )
+        c = float(
+            gt_answer is not None
+            and pred_answer is not None
+            and gt_answer == pred_answer
+        )
+        details = {"C": c}
+        if not gt_entries:
+            details["reward"] = c * (1.0 if not pred_entries else 0.2)
+            return details
+        r2 = _score_r2(gt_entries, pred_entries)
+        r3 = _score_r3(gt_entries, pred_entries, matches)
+        r4 = _score_r4(pred_obj, gt_obj)
+        details.update(
+            R2=r2,
+            R3=r3,
+            R4=r4,
+            reward=c * (0.1 + 0.25 * r2 + 0.25 * r3 + 0.4 * r4),
+        )
+        return details
+
+    if data_source in SPATIAL_DETECTION_SOURCES:
+        r2 = _score_r2(gt_entries, pred_entries)
+        r3 = _score_r3(gt_entries, pred_entries, matches)
+        r4 = _score_r4(pred_obj, gt_obj)
+        return {
+            "R2": r2,
+            "R3": r3,
+            "R4": r4,
+            "reward": 0.25 * r2 + 0.25 * r3 + 0.5 * r4,
+        }
+
+    raise ValueError(
+        f"未知的 data_source: {data_source!r}，不在任何奖励路由集合中。"
+        f"已知值: {sorted(KNOWN_SOURCES)}。"
+    )
+
+
+def score_answer_and_summary(data_source, solution_str, ground_truth):
+    """按 ``data_source`` 路由外部模型的 C 与 R4 奖励。
+
+    外部模型只输出 ``answer``/``summary``，因此不计算或伪造 bbox 子项。
+    ``humanref_cot`` 没有 answer/summary GT，无法用于这条外部模型路线。
+    """
+    if data_source in HUNGARIAN_IOU_SOURCES:
+        raise ValueError(
+            f"data_source={data_source!r} 的 GT 只有 boxes，"
+            "无法计算外部模型的 C/R4"
+        )
+    if data_source in JSON_ANSWER_SOURCES:
+        c = score_json_answer(solution_str, ground_truth)
+    elif (data_source in ANSWER_SUMMARY_EVAL_SOURCES
+          or data_source in SPATIAL_CONSISTENCY_BBOX_SOURCES
+          or data_source in SPATIAL_DETECTION_SOURCES):
+        gt_obj = _parse_json_obj(ground_truth)
+        pred_obj = _parse_json_obj(solution_str)
+        gt_answer = _normalize_answer(
+            gt_obj.get("answer") if isinstance(gt_obj, dict) else None
+        )
+        pred_answer = _normalize_answer(
+            pred_obj.get("answer") if isinstance(pred_obj, dict) else None
+        )
+        c = float(
+            gt_answer is not None
+            and pred_answer is not None
+            and gt_answer == pred_answer
+        )
+    else:
+        raise ValueError(
+            f"未知的 data_source: {data_source!r}，不在任何奖励路由集合中。"
+            f"已知值: {sorted(KNOWN_SOURCES)}。"
+        )
+
+    gt_obj = _parse_json_obj(ground_truth)
+    pred_obj = _parse_json_obj(solution_str)
+    return {"C": c, "R4": _score_r4(pred_obj, gt_obj)}
+
+
 # ============================================================
 # 分类路由（按 data_source 分发）
 # ============================================================
+
+INCONSISTENT_COT_LOCAL_EVAL_SOURCE = "inconsistent_cot_local_eval"
+INCONSISTENT_COT_GEMINI_EVAL_SOURCE = "inconsistent_cot_gemini_eval"
 
 JSON_ANSWER_SOURCES = {
     "spatial_consistency_pos",
@@ -842,6 +950,15 @@ HUNGARIAN_IOU_SOURCES = {
 SPATIAL_CONSISTENCY_BBOX_SOURCES = {
     "spatial_consistency_bbox_pos",
     "spatial_consistency_bbox_neg",
+    # rollout_parquet_to_html.py 只评测 inconsistent CoT 数据。本地路由
+    # 计算 C/R2/R3/R4/reward，不依赖输入 Parquet 的 data_source。
+    INCONSISTENT_COT_LOCAL_EVAL_SOURCE,
+}
+
+# Gemini 只输出 answer/summary，使用独立路由计算 C/R4。该路由
+# 故意不加入 SPATIAL_CONSISTENCY_BBOX_SOURCES，避免被误用为 bbox 奖励。
+ANSWER_SUMMARY_EVAL_SOURCES = {
+    INCONSISTENT_COT_GEMINI_EVAL_SOURCE,
 }
 
 SPATIAL_DETECTION_SOURCES = {
@@ -849,7 +966,8 @@ SPATIAL_DETECTION_SOURCES = {
 }
 
 KNOWN_SOURCES = (JSON_ANSWER_SOURCES | HUNGARIAN_IOU_SOURCES
-                 | SPATIAL_CONSISTENCY_BBOX_SOURCES | SPATIAL_DETECTION_SOURCES)
+                 | SPATIAL_CONSISTENCY_BBOX_SOURCES | SPATIAL_DETECTION_SOURCES
+                 | ANSWER_SUMMARY_EVAL_SOURCES)
 
 
 def compute_score(data_source, solution_str, ground_truth, extra_info=None):
@@ -1068,6 +1186,9 @@ if __name__ == "__main__":
         ("spatial_consistency_bbox_pos",
          scb_think + '{"answer": "A", "boxes": []}',
          gt_pos, 1.0),
+        (INCONSISTENT_COT_LOCAL_EVAL_SOURCE,
+         scb_think + '{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move (100, 50)"}]}',
+         sd_gt_route, 1.0),
         # R2=1, R3=1, R4=1 → R = 0.25+0.25+0.5 = 1.0
         ("spatial_detection",
          '{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move (100, 50)"}]}',
