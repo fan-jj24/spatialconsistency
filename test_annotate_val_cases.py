@@ -77,5 +77,38 @@ class AnnotateSecondImageTest(unittest.TestCase):
         self.assertIsNone(annotation._direction("move (nan, 0, 1)", bbox))
 
 
+class HtmlArrowLabelFilterTest(unittest.TestCase):
+    def test_removes_only_valid_3d_arrow_labels(self):
+        text = (
+            'prefix {"boxes":['
+            '{"bbox":[0,0,100,100],"label":"move right (1, 0, -1)"},'
+            '{"bbox":[100,100,200,200],"label":"move (300, 150)"},'
+            '{"bbox":[200,200,300,300],"label":"move (0, 0, 0)"},'
+            '{"bbox":[300,300,400,400],"label":"delete"}'
+            ']} suffix'
+        )
+
+        filtered = annotation._without_3d_arrow_labels(text)
+
+        self.assertNotIn("move right (1, 0, -1)", filtered)
+        self.assertIn('"bbox":[0,0,100,100]', filtered)
+        self.assertIn("move (300, 150)", filtered)
+        self.assertIn("move (0, 0, 0)", filtered)
+        self.assertIn("delete", filtered)
+        self.assertTrue(filtered.startswith("prefix "))
+        self.assertTrue(filtered.endswith(" suffix"))
+
+    def test_filters_only_the_box_object_used_for_annotation(self):
+        text = (
+            '{"boxes":[{"bbox":[0,0,1,1],"label":"old (1, 0, -1)"}]} '
+            '{"boxes":[{"bbox":[0,0,1,1],"label":"new (0, 1, -1)"}]}'
+        )
+
+        filtered = annotation._without_3d_arrow_labels(text)
+
+        self.assertIn("old (1, 0, -1)", filtered)
+        self.assertNotIn("new (0, 1, -1)", filtered)
+
+
 if __name__ == "__main__":
     unittest.main()

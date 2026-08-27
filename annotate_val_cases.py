@@ -504,6 +504,57 @@ def _direction(label: str, bbox: list[float]) -> tuple[float, ...] | None:
     return None
 
 
+def _without_3d_arrow_labels(text: str) -> str:
+    """Remove labels for valid 3D arrows from the JSON shown in the HTML.
+
+    Only the last JSON object containing ``boxes`` is used for image annotation,
+    so filtering the same object keeps the text panel consistent with the image.
+    The original text remains stored on the case and is still used for exports.
+    """
+    decoder = json.JSONDecoder()
+    objects: list[tuple[int, int, dict[str, Any]]] = []
+    for match in re.finditer(r"\{", text or ""):
+        try:
+            obj, end = decoder.raw_decode(text, match.start())
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+        if isinstance(obj, dict) and isinstance(obj.get("boxes"), list):
+            objects.append((match.start(), end, obj))
+    if not objects:
+        return text
+
+    start, end, obj = objects[-1]
+    filtered_boxes = []
+    changed = False
+    for item in obj["boxes"]:
+        filtered_item = item
+        if isinstance(item, dict) and isinstance(item.get("label"), str):
+            bbox = _plain(item.get("bbox"))
+            if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                try:
+                    coords = [float(value) for value in bbox]
+                except (TypeError, ValueError):
+                    coords = []
+                if len(coords) == 4 and all(math.isfinite(value) for value in coords):
+                    direction = _direction(item["label"], coords)
+                    if (
+                        direction is not None
+                        and len(direction) == 3
+                        and math.sqrt(sum(value * value for value in direction)) >= 1e-6
+                    ):
+                        filtered_item = {key: value for key, value in item.items()
+                                         if key != "label"}
+                        changed = True
+        filtered_boxes.append(filtered_item)
+    if not changed:
+        return text
+
+    filtered_obj = dict(obj)
+    filtered_obj["boxes"] = filtered_boxes
+    replacement = json.dumps(filtered_obj, ensure_ascii=False, separators=(",", ":"))
+    return f"{text[:start]}{replacement}{text[end:]}"
+
+
 def _arrow(draw, center, direction, color, width: int, sx: float, sy: float) -> None:
     dx, dy = direction[0] * sx, direction[1] * sy
     magnitude = math.hypot(dx, dy)
@@ -903,8 +954,8 @@ function render() {
       <button class="verdict unsure ${a.verdict==='uncertain'?'active':''}" data-v="uncertain">不确定 <span class="kbd">3</span></button>
       <button class="verdict" data-v="">清除</button>
     </div><textarea id="note" placeholder="备注（自动保存在当前浏览器）"></textarea></div>`;
-  $('gt').textContent = c.gt;
-  $('pred').textContent = c.pred;
+  $('gt').textContent = c.gt_display;
+  $('pred').textContent = c.pred_display;
   if ($('gemini')) $('gemini').textContent = c.gemini;
   $('note').value = a.note || '';
   document.querySelectorAll('[data-v]').forEach(button => button.onclick = () => setVerdict(button.dataset.v));
@@ -1055,6 +1106,10 @@ def build_html(
         "source_row": case.source_row,
         "gt": case.ground_truth,
         "pred": case.prediction,
+        "gt_display": (_without_3d_arrow_labels(case.ground_truth)
+                       if case.image_paths else case.ground_truth),
+        "pred_display": (_without_3d_arrow_labels(case.prediction)
+                         if case.image_paths else case.prediction),
         "gemini": case.gemini_prediction,
         "data_source": case.data_source,
         "local_scores": case.local_scores,
