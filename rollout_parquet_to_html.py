@@ -3,7 +3,7 @@ r"""Run local/Gemini rollouts on Parquet rows, score them, and build HTML.
 
 This script is intended for a Windows workstation with one CUDA GPU.  It reads
 one VERL ``train.parquet`` through the same Hugging Face ``datasets`` loader
-used by VERL, selects 200 rows by default, generates one
+used by VERL, selects 100 rows by default, generates one
 full response with the supplied local Hugging Face model and an answer/summary
 response with Gemini, then calculates reward details and reuses the interactive
 human-accuracy page from ``annotate_val_cases.py``.
@@ -11,20 +11,23 @@ human-accuracy page from ``annotate_val_cases.py``.
 Example (PowerShell, one line)::
 
     python rollout_parquet_to_html.py --model_path D:\models\Qwen_RL \
-      --data_path D:\RL1\train.parquet --num_samples 200 \
-      --out_dir D:\eval\train_200
+      --data_path D:\RL1\train.parquet --num_samples 100 \
+      --out_dir D:\eval\train_100
 
 Dependencies::
 
     pip install torch torchvision transformers accelerate datasets pyarrow pillow requests oss2
 
-Local and Gemini results are checkpointed separately.  If a run is interrupted,
-repeat the command with ``--resume``.
+Local and Gemini results are checkpointed separately.  By default, an existing
+local checkpoint is replaced, while an existing complete Gemini checkpoint is
+validated and reused without making any Gemini/OSS requests.  If a local run is
+interrupted, repeat the command with ``--resume``.
 
-Gemini requires ``IDEALAB_API_KEY`` plus the four ``OUTER_OSS_*`` variables
-used by ``run_gemini.py``.  After both rollout paths finish, this script releases
-the local generation model, starts ``reward_model_server.py``, waits for its
-health check, calculates all rewards, and then stops the reward service.
+Generating a new Gemini checkpoint requires ``IDEALAB_API_KEY`` plus the four
+``OUTER_OSS_*`` variables used by ``run_gemini.py``; reusing one does not.  After
+both rollout paths finish, this script releases the local generation model,
+starts ``reward_model_server.py``, waits for its health check, calculates all
+rewards, and then stops the reward service.
 """
 
 from __future__ import annotations
@@ -596,10 +599,12 @@ def _validate_gemini_checkpoint(
         mismatched = [key for key, value in expected.items() if saved.get(key) != value]
         if saved.get("data_source") != selected[source_row].gemini_data_source:
             mismatched.append("data_source")
+        if saved.get("ground_truth") != selected[source_row].ground_truth:
+            mismatched.append("ground_truth")
         if mismatched:
             raise ValueError(
                 f"Gemini checkpoint 中 Parquet row {source_row} 参数不同: "
-                f"{', '.join(mismatched)}；请恢复原参数或使用 --overwrite"
+                f"{', '.join(mismatched)}；请恢复原参数或移走该文件后重跑"
             )
 
 
@@ -610,16 +615,28 @@ def run_gemini_rollout(
     checkpoint_path: Path,
     args: argparse.Namespace,
 ) -> None:
-    completed = _read_checkpoint(checkpoint_path) if args.resume else {}
+    checkpoint_exists = checkpoint_path.is_file()
+    completed = _read_checkpoint(checkpoint_path) if checkpoint_exists else {}
     _validate_gemini_checkpoint(completed, rows, args)
-    pending: list[EvalRow] = []
-    for row in rows:
-        saved = completed.get(row.source_row)
-        if saved is not None and not (args.retry_errors and saved.get("gemini_error")):
+    if checkpoint_exists:
+        missing = [row.source_row for row in rows if row.source_row not in completed]
+        if missing:
+            preview = ", ".join(map(str, missing[:10]))
+            if len(missing) > 10:
+                preview += ", ..."
+            raise ValueError(
+                f"Gemini checkpoint 缺少本次抽样的 {len(missing)} 条 row: {preview}；"
+                "为避免混用 case，不会调用 Gemini 补齐。请使用匹配的抽样参数，"
+                "或移走 gemini_results.jsonl 后重跑"
+            )
+        for row in rows:
+            saved = completed[row.source_row]
             row.gemini_prediction = str(saved.get("gemini_prediction", ""))
             row.gemini_error = str(saved.get("gemini_error", ""))
-        else:
-            pending.append(row)
+        print(f"Gemini checkpoint 已存在，直接复用 {len(rows)} 条，不调用 Gemini")
+        return
+
+    pending = list(rows)
     print(f"Gemini 已完成 {len(rows) - len(pending)} 条；本次需生成 {len(pending)} 条")
     if not pending:
         return
@@ -971,8 +988,8 @@ def parse_args() -> argparse.Namespace:
                         help="输入 VERL train.parquet 地址")
     parser.add_argument("--out_dir", "--out-dir", required=True,
                         help="输出目录（包含 checkpoint、assets 和 index.html）")
-    parser.add_argument("--num_samples", "--num-samples", type=int, default=200,
-                        help="评测条数，默认 200")
+    parser.add_argument("--num_samples", "--num-samples", type=int, default=100,
+                        help="评测条数，默认 100")
     parser.add_argument("--selection", choices=("random", "first"), default="random",
                         help="random=固定种子随机抽取；first=从 start_row 连续取，默认 random")
     parser.add_argument("--seed", type=int, default=42, help="抽样随机种子，默认 42")
@@ -983,8 +1000,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0", help="模型设备，默认 cuda:0")
     parser.add_argument("--dtype", choices=("auto", "bfloat16", "float16", "float32"),
                         default="bfloat16", help="模型 dtype，默认 bfloat16")
-    parser.add_argument("--batch_size", "--batch-size", type=int, default=1,
-                        help="生成 batch size，默认 1；显存充足可提高")
+    parser.add_argument("--batch_size", "--batch-size", type=int, default=10,
+                        help="本地模型生成 batch size，默认 10")
     parser.add_argument("--max_prompt_length", "--max-prompt-length", type=int, default=2048,
                         help="与当前 VERL rollout.prompt_length 一致，默认 2048")
     parser.add_argument("--max_new_tokens", "--max-new-tokens", type=int, default=4096,
@@ -997,17 +1014,17 @@ def parse_args() -> argparse.Namespace:
                         help="默认 -1（关闭），与当前 VERL rollout 一致")
     parser.add_argument("--repetition_penalty", "--repetition-penalty", type=float, default=1.0)
     parser.add_argument("--resume", action="store_true",
-                        help="从现有 rollout_results.jsonl 继续")
+                        help="从现有本地 rollout_results.jsonl 继续")
     parser.add_argument("--retry_errors", "--retry-errors", action="store_true",
-                        help="与 --resume 一起使用时重试之前失败的条目")
+                        help="与 --resume 一起使用时重试本地模型之前失败的条目")
     parser.add_argument("--overwrite", action="store_true",
-                        help="允许覆盖已有 checkpoint（不删除目录内其他文件）")
+                        help="覆盖本地 checkpoint（默认行为；保留此参数以兼容旧命令）")
     parser.add_argument("--trust_remote_code", "--trust-remote-code", action=argparse.BooleanOptionalAction,
                         default=True, help="是否允许模型仓库代码，默认开启")
     parser.add_argument("--gemini", action=argparse.BooleanOptionalAction, default=True,
                         help="是否并行调用 Gemini，默认开启；离线调试可用 --no-gemini")
-    parser.add_argument("--gemini_workers", "--gemini-workers", type=int, default=8,
-                        help="Gemini API 并发数，默认 8")
+    parser.add_argument("--gemini_workers", "--gemini-workers", type=int, default=10,
+                        help="Gemini API 并发数，默认 10")
     parser.add_argument("--gemini_max_retries", "--gemini-max-retries", type=int, default=3,
                         help="Gemini 瞬态失败最大尝试次数，默认 3")
     parser.add_argument("--gemini_thinking_level", "--gemini-thinking-level",
@@ -1018,8 +1035,8 @@ def parse_args() -> argparse.Namespace:
                         help="上传 Gemini 输入图片使用的 OSS key 前缀")
     parser.add_argument("--gemini_max_image_edge", "--gemini-max-image-edge", type=int,
                         default=2048, help="Gemini 输入图片上传前的最长边，默认 2048")
-    parser.add_argument("--reward_workers", "--reward-workers", type=int, default=8,
-                        help="奖励计算并发数，默认 8，便于 R4 服务动态合批")
+    parser.add_argument("--reward_workers", "--reward-workers", type=int, default=100,
+                        help="奖励计算并发数，默认 100，便于 R4 服务动态合批")
     parser.add_argument(
         "--auto_reward_server", "--auto-reward-server",
         action=argparse.BooleanOptionalAction,
@@ -1042,8 +1059,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--reward_max_batch_size", "--reward-max-batch-size",
         type=int,
-        default=32,
-        help="R4 服务动态合批上限，默认 32",
+        default=100,
+        help="R4 服务动态合批上限，默认 100",
     )
     parser.add_argument(
         "--reward_max_wait_ms", "--reward-max-wait-ms",
@@ -1112,19 +1129,8 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     local_checkpoint_path = out_dir / "rollout_results.jsonl"
     gemini_checkpoint_path = out_dir / "gemini_results.jsonl"
-    checkpoint_paths = [local_checkpoint_path]
-    if args.gemini:
-        checkpoint_paths.append(gemini_checkpoint_path)
-    existing = [path for path in checkpoint_paths if path.exists()]
-    if existing and not args.resume:
-        if args.overwrite:
-            for path in existing:
-                path.unlink()
-        else:
-            raise SystemExit(
-                f"ERROR: 已存在 {existing[0]}；继续请加 --resume，重跑请加 --overwrite"
-            )
-    if args.gemini:
+    reuse_gemini = args.gemini and gemini_checkpoint_path.is_file()
+    if args.gemini and not reuse_gemini:
         missing_env = [
             name for name in (
                 "IDEALAB_API_KEY",
@@ -1156,7 +1162,16 @@ def main() -> None:
         f"数据共 {total} 条；{args.selection} 抽取 {len(rows)} 条；"
         f"row 范围 {rows[0].source_row}..{rows[-1].source_row}"
     )
-    if args.gemini:
+    if reuse_gemini:
+        run_gemini_rollout(
+            rows, data_path, out_dir, gemini_checkpoint_path, args
+        )
+
+    if local_checkpoint_path.exists() and not args.resume:
+        local_checkpoint_path.unlink()
+        print(f"覆盖本地 checkpoint: {local_checkpoint_path}")
+
+    if args.gemini and not reuse_gemini:
         print("本地模型与 Gemini 并行生成...")
         with ThreadPoolExecutor(max_workers=2) as executor:
             futures = [
@@ -1175,7 +1190,10 @@ def main() -> None:
             for future in as_completed(futures):
                 future.result()
     else:
-        print("Gemini：关闭；运行本地模型...")
+        if reuse_gemini:
+            print("Gemini：使用已有 checkpoint；重新运行本地模型...")
+        else:
+            print("Gemini：关闭；运行本地模型...")
         run_rollout(rows, data_path, local_checkpoint_path, args)
 
     print("两路生成完成。")

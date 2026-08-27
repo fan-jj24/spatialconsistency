@@ -241,8 +241,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
-    # 每对 summary 对应一个四分类 prompt；默认一次送入 vLLM 32 条。
-    parser.add_argument("--max-batch-size", type=int, default=32)
+    # 每对 summary 对应一个四分类 prompt；默认一次送入 vLLM 100 条。
+    parser.add_argument("--max-batch-size", type=int, default=100)
     parser.add_argument("--max-wait-ms", type=float, default=20.0)
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
