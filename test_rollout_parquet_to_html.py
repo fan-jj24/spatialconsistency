@@ -10,7 +10,7 @@ import rollout_parquet_to_html as rollout
 
 
 class PromptAnswerRevealTest(unittest.TestCase):
-    def test_appends_only_gt_answer_as_a_separate_message(self):
+    def test_appends_natural_language_gt_answer_as_a_separate_message(self):
         row = {
             "prompt": [{"role": "user", "content": "describe the images"}],
             "reward_model": {
@@ -31,7 +31,13 @@ class PromptAnswerRevealTest(unittest.TestCase):
             messages,
             [
                 {"role": "user", "content": "describe the images"},
-                {"role": "user", "content": "inconsistent"},
+                {
+                    "role": "user",
+                    "content": (
+                        "The correct answer is inconsistent. "
+                        "Please complete the requested output based on this answer."
+                    ),
+                },
             ],
         )
         serialized = json.dumps(messages, ensure_ascii=False)

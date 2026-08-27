@@ -285,8 +285,12 @@ def build_messages_and_images(
             if isinstance(answer, str)
             else json.dumps(answer, ensure_ascii=False, separators=(",", ":"))
         )
-        # Intentionally add only the answer value: no label, instruction, or other GT.
-        messages.append({"role": "user", "content": answer_text})
+        reveal_text = (
+            f"The correct answer is {answer_text}. "
+            "Please complete the requested output based on this answer."
+        )
+        # Reveal only the answer value; never include other ground-truth fields.
+        messages.append({"role": "user", "content": reveal_text})
     return messages, images
 
 
@@ -1074,7 +1078,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--reveal_gt_answer", "--reveal-gt-answer",
         action="store_true",
-        help="在原 prompt 后单独追加 GT 的 answer 值，不追加任何其他 GT 内容",
+        help="在原 prompt 后用自然语言透露 GT answer，并要求据此完成输出",
     )
     parser.add_argument("--num_samples", "--num-samples", type=int, default=100,
                         help="评测条数，默认 100")
