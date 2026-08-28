@@ -76,9 +76,9 @@ JSON RLVR Reward Function（分类奖励框架）
 
     方向系数 dir_coef（原 R4 融入，仅在 move 同时 ∈ gt_kw 且 ∈ pred_kw 时生效）:
       GT label 有箭头向量:
-        同维度: dir_coef = cosθ（2 值算2D，3 值算3D）
-        不同维度: 比较共同的 XY 投影，再对称扣 0.1
-        同向=1, 垂直=0, 反向=-1；零向量的余弦记0；结果 clamp 到 [-1,1]
+        同维度: dir_coef = max(0, cosθ)（2 值算2D，3 值算3D）
+        不同维度: 比较共同的 XY 投影，再对称扣 0.1，下限为 0
+        同向=1, 垂直/反向=0；零向量的余弦记0；结果 clamp 到 [0,1]
       GT label 有 move 但无箭头:
         dir_coef = 1.0（GT 没要求方向，pred 有 move 且格式合规即可）
       否则: dir_coef = 1.0（该对不涉及 move，不缩放）
@@ -640,12 +640,12 @@ def _score_r3(gt_entries, pred_entries, matches):
                             cos_theta = np.dot(gt_cmp, pred_cmp) / norm
                             if np.isfinite(cos_theta):
                                 dir_coef = max(
-                                    -1.0, min(1.0, float(cos_theta))
+                                    0.0, min(1.0, float(cos_theta))
                                 )
                         # 维度不匹配时双向对称扣分；即使 XY 投影
-                        # 是零向量，也保留这一维度惩罚。
+                        # 是零向量，也执行扣分，但不会低于 0。
                         if gt_ndim != pred_ndim:
-                            dir_coef = max(-1.0, dir_coef - 0.1)
+                            dir_coef = max(0.0, dir_coef - 0.1)
                 # GT 有 move 但无箭头 → dir_coef 保持 1.0。
                 # pred 有 move 但无合法箭头 → 已被格式门控拦截。
                 label_points += dir_coef - 1.0
@@ -1116,9 +1116,9 @@ if __name__ == "__main__":
         # GT 2D、pred 3D 也扣 0.1，不再鼓励固定输出 3 值。
         (SCB_NEG, scb_think + '{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move (1, 0, 0)"}]}',
          gt_neg, 0.975, "GT2D-pred3D对称扣0.1"),
-        # 纯深度向量的 XY 投影为零：余弦记0，仍扣维度惩罚。
+        # 纯深度向量的 XY 投影为零：余弦记0，维度扣分不低于0。
         (SCB_NEG, scb_think + '{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move (100, 50)"}]}',
-         gt_neg_depth, 0.725, "纯深度与2D比较dir=-0.1"),
+         gt_neg_depth, 0.75, "纯深度与2D比较dir下限为0"),
         # 负例部分重叠: R2=1/7, R3: dir=0 → R3=0, R4=1
         #   R = 0.1 + 0.25/7 + 0 + 0.4 = 0.5357
         (SCB_NEG, scb_think + '{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [50,50,150,150], "label": "move (100, 50)"}]}',
@@ -1144,9 +1144,9 @@ if __name__ == "__main__":
         # 格式门控: pred 有 move 且多组向量 → R3=-1, R4=1
         (SCB_NEG, scb_think + '{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move (100, 50) (200, 50)"}]}',
          gt_neg, 0.5, "格式门控:多组向量→R3=-1"),
-        # 方向反向: dir=-1, R3=-1, R4=1 → R = 0.1 + 0.25 - 0.25 + 0.4 = 0.5
+        # 方向反向: dir=0, R3=0, R4=1 → R = 0.1 + 0.25 + 0 + 0.4 = 0.75
         (SCB_NEG, scb_think + '{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move (0, 50)"}]}',
-         gt_neg, 0.5, "方向反向dir=-1"),
+         gt_neg, 0.75, "方向反向dir截断为0"),
         # GT move 无箭头, pred move 有箭头 → dir_coef=1, R3=1, R4=1
         #   R = 0.1 + 0.25 + 0.25 + 0.4 = 1.0
         (SCB_NEG, scb_think + '{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move (100, 50)"}]}',
@@ -1227,9 +1227,9 @@ if __name__ == "__main__":
         # 格式门控: pred move 无箭头 → R3=-1, R4=1 → R = 0.25 - 0.25 + 0.5 = 0.5
         ('{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move"}]}',
          sd_gt, 0.5, "格式门控:move无箭头→R3=-1"),
-        # 方向反向: dir=-1, R3=-1, R4=1 → R = 0.25 - 0.25 + 0.5 = 0.5
+        # 方向反向: dir=0, R3=0, R4=1 → R = 0.25 + 0 + 0.5 = 0.75
         ('{"answer": "B", "summary": "inconsistent", "boxes": [{"bbox": [0,0,100,100], "label": "move (0, 50)"}]}',
-         sd_gt, 0.5, "方向反向dir=-1"),
+         sd_gt, 0.75, "方向反向dir截断为0"),
     ]
     for i, (sol, gt, exp, desc) in enumerate(cases_4):
         score = compute_score("spatial_detection", sol, gt)
