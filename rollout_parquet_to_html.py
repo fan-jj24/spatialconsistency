@@ -1,33 +1,38 @@
 #!/usr/bin/env python3
-r"""Run local/Gemini rollouts on Parquet rows, score them, and build HTML.
+r"""Run Qwen/Gemini/optional InternVL rollouts, score them, and build HTML.
 
 This script is intended for a Windows workstation with one CUDA GPU.  It reads
 one VERL ``train.parquet`` through the same Hugging Face ``datasets`` loader
-used by VERL, selects 100 rows by default, generates one
-full response with the supplied local Hugging Face model and an answer/summary
-response with Gemini, then calculates reward details and reuses the interactive
-human-accuracy page from ``annotate_val_cases.py``.
+used by VERL, selects 100 rows by default, generates full responses with Qwen
+and optional InternVL plus an answer/summary response with Gemini, then
+calculates reward details and reuses the interactive human-accuracy page from
+``annotate_val_cases.py``.
 
 Example (PowerShell, one line)::
 
     python rollout_parquet_to_html.py --model_path D:\models\Qwen_RL \
+      --internvl_model_path D:\models\InternVL3_5-14B-HF \
       --data_path D:\RL1\train.parquet --num_samples 100 \
       --out_dir D:\eval\train_100
 
 Dependencies::
 
-    pip install torch torchvision transformers accelerate datasets pyarrow pillow requests oss2
+    pip install torch torchvision "transformers>=4.52.1" accelerate datasets pyarrow pillow requests oss2
 
-Local and Gemini results are checkpointed separately.  By default, an existing
-local checkpoint is replaced, while an existing complete Gemini checkpoint is
-validated and reused without making any Gemini/OSS requests.  If a local run is
-interrupted, repeat the command with ``--resume``.
+Qwen, Gemini, and InternVL results are checkpointed separately.  By default, an
+existing local checkpoint is replaced, while an existing complete Gemini
+checkpoint is validated and reused without making any Gemini/OSS requests.  If
+a local run is interrupted, repeat the command with ``--resume``.
+
+Passing ``--internvl_model_path`` enables a third rollout.  In that mode,
+existing Qwen/Gemini checkpoints are reused, and Qwen then InternVL run serially
+on the local GPU while Gemini occupies its own parallel branch.
 
 Generating a new Gemini checkpoint reads ``ak``, ``sk``, ``ep``, ``bn``, and
 ``api_key`` from a non-versioned ``key.py`` beside this script; reusing one does
-not need that file.  After both rollout paths finish, this script releases the
-local generation model, starts ``reward_model_server.py``, waits for its health
-check, calculates all rewards, and then stops the reward service.
+not need that file.  After every enabled rollout finishes, this script starts
+``reward_model_server.py``, waits for its health check, calculates all rewards,
+and then stops the reward service.
 """
 
 from __future__ import annotations
@@ -90,8 +95,11 @@ class EvalRow:
     generation_error: str = ""
     gemini_prediction: str = ""
     gemini_error: str = ""
+    internvl_prediction: str = ""
+    internvl_error: str = ""
     local_scores: dict[str, float] | None = None
     gemini_scores: dict[str, float] | None = None
+    internvl_scores: dict[str, float] | None = None
     evaluation_error: str = ""
 
 
@@ -378,7 +386,12 @@ def _prepare_gemini_request(
 
 
 class TransformersRollout:
-    def __init__(self, args: argparse.Namespace):
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        model_path: str | None = None,
+        model_label: str = "本地模型",
+    ):
         try:
             import torch
             from transformers import AutoProcessor
@@ -399,15 +412,16 @@ class TransformersRollout:
             "float16": torch.float16,
             "float32": torch.float32,
         }
-        print(f"加载 processor: {args.model_path}")
+        selected_model_path = model_path or args.model_path
+        print(f"加载 {model_label} processor: {selected_model_path}")
         processor = AutoProcessor.from_pretrained(
-            args.model_path,
+            selected_model_path,
             trust_remote_code=args.trust_remote_code,
         )
-        print(f"加载模型到 {args.device}（dtype={args.dtype}）...")
+        print(f"加载 {model_label} 到 {args.device}（dtype={args.dtype}）...")
         try:
             model = ModelLoader.from_pretrained(
-                args.model_path,
+                selected_model_path,
                 trust_remote_code=args.trust_remote_code,
                 torch_dtype=dtype_by_name[args.dtype],
                 device_map={"": args.device},
@@ -521,14 +535,21 @@ def _read_checkpoint(path: Path) -> dict[int, dict[str, Any]]:
     return completed
 
 
-def _append_checkpoint(path: Path, eval_row: EvalRow, args: argparse.Namespace) -> None:
+def _append_checkpoint(
+    path: Path,
+    eval_row: EvalRow,
+    args: argparse.Namespace,
+    *,
+    prediction_attr: str = "prediction",
+    error_attr: str = "generation_error",
+) -> None:
     payload = {
         "source_row": eval_row.source_row,
         "sample_order": eval_row.order,
         "data_source": eval_row.local_data_source,
         "ground_truth": eval_row.ground_truth,
-        "prediction": eval_row.prediction,
-        "generation_error": eval_row.generation_error,
+        prediction_attr: getattr(eval_row, prediction_attr),
+        error_attr: getattr(eval_row, error_attr),
         "model_path": str(Path(args.model_path)),
         "data_path": str(Path(args.data_path)),
         "seed": args.seed,
@@ -582,27 +603,34 @@ def _validate_checkpoint(
             )
 
 
-def run_rollout(
+def _run_transformers_rollout(
     rows: list[EvalRow],
     data_path: Path,
     checkpoint_path: Path,
     args: argparse.Namespace,
+    *,
+    prediction_attr: str,
+    error_attr: str,
+    model_label: str,
 ) -> None:
     completed = _read_checkpoint(checkpoint_path) if args.resume else {}
     _validate_checkpoint(completed, rows, args)
     pending: list[EvalRow] = []
     for row in rows:
         saved = completed.get(row.source_row)
-        if saved is not None and not (args.retry_errors and saved.get("generation_error")):
-            row.prediction = str(saved.get("prediction", ""))
-            row.generation_error = str(saved.get("generation_error", ""))
+        if saved is not None and not (args.retry_errors and saved.get(error_attr)):
+            setattr(row, prediction_attr, str(saved.get(prediction_attr, "")))
+            setattr(row, error_attr, str(saved.get(error_attr, "")))
         else:
             pending.append(row)
-    print(f"已完成 {len(rows) - len(pending)} 条；本次需生成 {len(pending)} 条")
+    print(
+        f"{model_label}：已完成 {len(rows) - len(pending)} 条；"
+        f"本次需生成 {len(pending)} 条"
+    )
     if not pending:
         return
 
-    engine = TransformersRollout(args)
+    engine = TransformersRollout(args, model_label=model_label)
     try:
         engine.torch.manual_seed(args.generation_seed)
         if engine.torch.cuda.is_available():
@@ -614,28 +642,96 @@ def run_rollout(
             try:
                 predictions = engine.generate(batch, data_path)
                 for row, prediction in zip(batch, predictions, strict=True):
-                    row.prediction = prediction
+                    setattr(row, prediction_attr, prediction)
             except Exception as batch_exc:
                 if len(batch) == 1:
-                    batch[0].generation_error = f"{type(batch_exc).__name__}: {batch_exc}"
-                    print(f"  [WARN] Parquet row {batch[0].source_row} 生成失败: {batch_exc}")
+                    setattr(
+                        batch[0], error_attr,
+                        f"{type(batch_exc).__name__}: {batch_exc}",
+                    )
+                    print(
+                        f"  [WARN] {model_label} Parquet row "
+                        f"{batch[0].source_row} 生成失败: {batch_exc}"
+                    )
                 else:
-                    print(f"  [WARN] batch 生成失败，逐条重试: {batch_exc}")
+                    print(
+                        f"  [WARN] {model_label} batch 生成失败，逐条重试: "
+                        f"{batch_exc}"
+                    )
                     if engine.torch.cuda.is_available():
                         engine.torch.cuda.empty_cache()
                     for row in batch:
                         try:
-                            row.prediction = engine.generate([row], data_path)[0]
+                            setattr(
+                                row,
+                                prediction_attr,
+                                engine.generate([row], data_path)[0],
+                            )
                         except Exception as row_exc:
-                            row.generation_error = f"{type(row_exc).__name__}: {row_exc}"
-                            print(f"  [WARN] Parquet row {row.source_row} 生成失败: {row_exc}")
+                            setattr(
+                                row,
+                                error_attr,
+                                f"{type(row_exc).__name__}: {row_exc}",
+                            )
+                            print(
+                                f"  [WARN] {model_label} Parquet row "
+                                f"{row.source_row} 生成失败: {row_exc}"
+                            )
             for row in batch:
-                _append_checkpoint(checkpoint_path, row, args)
+                _append_checkpoint(
+                    checkpoint_path,
+                    row,
+                    args,
+                    prediction_attr=prediction_attr,
+                    error_attr=error_attr,
+                )
                 completed_count += 1
-            print(f"  rollout {completed_count}/{len(rows)}")
+            print(f"  {model_label} rollout {completed_count}/{len(rows)}")
     finally:
-        print("释放本地 rollout 模型和 CUDA 缓存...")
+        print(f"释放 {model_label} rollout 模型和 CUDA 缓存...")
         engine.close()
+
+
+def run_rollout(
+    rows: list[EvalRow],
+    data_path: Path,
+    checkpoint_path: Path,
+    args: argparse.Namespace,
+) -> None:
+    _run_transformers_rollout(
+        rows,
+        data_path,
+        checkpoint_path,
+        args,
+        prediction_attr="prediction",
+        error_attr="generation_error",
+        model_label="Qwen",
+    )
+
+
+def run_internvl_rollout(
+    rows: list[EvalRow],
+    data_path: Path,
+    checkpoint_path: Path,
+    args: argparse.Namespace,
+) -> None:
+    if checkpoint_path.is_file() and getattr(args, "overwrite", False):
+        checkpoint_path.unlink()
+        print(f"覆盖 InternVL checkpoint: {checkpoint_path}")
+    internvl_args = copy.copy(args)
+    internvl_args.model_path = args.internvl_model_path
+    internvl_args.batch_size = args.internvl_batch_size
+    # InternVL has its own checkpoint and always resumes it when present.
+    internvl_args.resume = checkpoint_path.is_file()
+    _run_transformers_rollout(
+        rows,
+        data_path,
+        checkpoint_path,
+        internvl_args,
+        prediction_attr="internvl_prediction",
+        error_attr="internvl_error",
+        model_label="InternVL",
+    )
 
 
 def _append_gemini_checkpoint(
@@ -879,19 +975,28 @@ def calculate_rewards(
     rows: list[EvalRow],
     args: argparse.Namespace,
 ) -> None:
-    """Generate all reward details after both rollout paths have finished."""
+    """Generate all reward details after every enabled rollout has finished."""
     jobs = []
     for row in rows:
         if row.prediction and not row.generation_error:
             jobs.append((row, "local"))
         if args.gemini and row.gemini_prediction and not row.gemini_error:
             jobs.append((row, "gemini"))
+        if (
+            args.internvl_model_path
+            and row.internvl_prediction
+            and not row.internvl_error
+        ):
+            jobs.append((row, "internvl"))
 
     def score_one(job):
         row, kind = job
-        if kind == "local":
+        if kind in ("local", "internvl"):
+            prediction = (
+                row.prediction if kind == "local" else row.internvl_prediction
+            )
             scores = reward.compute_score_details(
-                row.local_data_source, row.prediction, row.ground_truth
+                row.local_data_source, prediction, row.ground_truth
             )
         else:
             scores = reward.score_answer_and_summary(
@@ -909,8 +1014,10 @@ def calculate_rewards(
                 _, _, scores = future.result()
                 if kind == "local":
                     row.local_scores = scores
-                else:
+                elif kind == "gemini":
                     row.gemini_scores = scores
+                else:
+                    row.internvl_scores = scores
             except Exception as exc:
                 errors.setdefault(row.source_row, []).append(
                     f"{kind}: {type(exc).__name__}: {exc}"
@@ -921,6 +1028,7 @@ def calculate_rewards(
     for row in rows:
         row.local_scores = row.local_scores or {}
         row.gemini_scores = row.gemini_scores or {}
+        row.internvl_scores = row.internvl_scores or {}
         row.evaluation_error = "; ".join(errors.get(row.source_row, []))
 
 
@@ -945,10 +1053,14 @@ def write_evaluation_results(
                 "gemini_prediction": row.gemini_prediction,
                 "gemini_error": row.gemini_error,
                 "gemini_scores": row.gemini_scores or {},
+                "internvl_prediction": row.internvl_prediction,
+                "internvl_error": row.internvl_error,
+                "internvl_scores": row.internvl_scores or {},
                 "evaluation_error": row.evaluation_error,
                 "temperature": args.temperature,
                 "reveal_gt_answer": args.reveal_gt_answer,
                 "gemini_model": GEMINI_MODEL if args.gemini else None,
+                "internvl_model_path": args.internvl_model_path,
             }
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
@@ -1018,6 +1130,11 @@ def build_report(
             gemini_prediction = (
                 f"[输出不符合要求]\n{row.gemini_error}\n\n{gemini_prediction}"
             ).rstrip()
+        internvl_prediction = row.internvl_prediction
+        if row.internvl_error:
+            internvl_prediction = (
+                f"[生成失败]\n{row.internvl_error}\n\n{internvl_prediction}"
+            ).rstrip()
         cases.append(annotation.Case(
             order=row.order,
             jsonl_line=row.source_row,
@@ -1029,13 +1146,19 @@ def build_report(
             image_paths=[],
             data_source=row.local_data_source,
             gemini_prediction=gemini_prediction,
+            internvl_prediction=internvl_prediction,
             local_scores=row.local_scores or {},
             gemini_scores=row.gemini_scores or {},
+            internvl_scores=row.internvl_scores or {},
             evaluation_error=row.evaluation_error,
             gemini_error=row.gemini_error if not gemini_prediction else "",
+            internvl_error=row.internvl_error if not internvl_prediction else "",
         ))
 
-    print("导出原图，并把 GT/本地预测框独立画到第二幅图（Gemini 不绘框）...")
+    print(
+        "导出原图，并把 GT/Qwen 预测框独立画到第二幅图"
+        "（Gemini/InternVL 不绘框）..."
+    )
     materialize_report_images(
         rows,
         cases,
@@ -1045,10 +1168,16 @@ def build_report(
     )
     out_path = out_dir / "index.html"
     model_name = Path(args.model_path.rstrip("/\\")).name or args.model_path
+    internvl_name = (
+        Path(args.internvl_model_path.rstrip("/\\")).name
+        if args.internvl_model_path
+        else "关闭"
+    )
     subtitle = (
         f"模型 {model_name} · 数据 {data_path.name} · {len(rows)} 条 · "
         f"temperature={args.temperature:g} · Gemini="
         f"{GEMINI_MODEL if args.gemini else '关闭'} · "
+        f"InternVL={internvl_name} · "
         f"透露GT answer={'是' if args.reveal_gt_answer else '否'}"
     )
     annotation.build_html(
@@ -1056,21 +1185,32 @@ def build_report(
         data_path,
         "rollout",
         out_path,
-        title=f"{data_path.name} 本地模型 / Gemini 对比评测",
+        title=f"{data_path.name} Qwen / Gemini / InternVL 对比评测",
         sources=list(dict.fromkeys(row.local_data_source for row in rows)),
         subtitle=subtitle,
         row_label="Parquet row",
         export_filename="rollout_annotations.jsonl",
+        show_internvl_column=True,
     )
     return out_path
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Windows 单卡并行运行本地模型/Gemini、计算奖励并生成 HTML"
+        description=(
+            "Windows 单卡运行 Qwen/可选 InternVL，并行调用 Gemini，"
+            "统一计算奖励并生成 HTML"
+        )
     )
     parser.add_argument("--model_path", "--model-path", required=True,
-                        help="本地 Hugging Face 模型目录")
+                        help="Qwen 本地 Hugging Face 模型目录")
+    parser.add_argument(
+        "--internvl_model_path", "--internvl-model-path",
+        help=(
+            "InternVL3.5-14B-HF 本地模型目录；指定后启用 InternVL，"
+            "并自动复用输出目录中已有的 Qwen/Gemini checkpoint"
+        ),
+    )
     parser.add_argument("--data_path", "--data-path", required=True,
                         help="输入 VERL train.parquet 地址")
     parser.add_argument("--out_dir", "--out-dir", required=True,
@@ -1093,7 +1233,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=("auto", "bfloat16", "float16", "float32"),
                         default="bfloat16", help="模型 dtype，默认 bfloat16")
     parser.add_argument("--batch_size", "--batch-size", type=int, default=10,
-                        help="本地模型生成 batch size，默认 10")
+                        help="Qwen 生成 batch size，默认 10")
+    parser.add_argument(
+        "--internvl_batch_size", "--internvl-batch-size",
+        type=int,
+        default=1,
+        help="InternVL 生成 batch size，默认 1",
+    )
     parser.add_argument("--max_prompt_length", "--max-prompt-length", type=int, default=2048,
                         help="与当前 VERL rollout.prompt_length 一致，默认 2048")
     parser.add_argument("--max_new_tokens", "--max-new-tokens", type=int, default=4096,
@@ -1188,8 +1334,8 @@ def parse_args() -> argparse.Namespace:
 
     if args.num_samples <= 0:
         parser.error("--num_samples 必须大于 0")
-    if args.batch_size <= 0:
-        parser.error("--batch_size 必须大于 0")
+    if args.batch_size <= 0 or args.internvl_batch_size <= 0:
+        parser.error("Qwen/InternVL batch size 必须大于 0")
     if args.gemini_workers <= 0 or args.reward_workers <= 0:
         parser.error("Gemini/reward workers 必须大于 0")
     if not args.reward_host.strip():
@@ -1233,6 +1379,11 @@ def main() -> None:
     args = parse_args()
     data_path = Path(args.data_path).expanduser().resolve()
     model_path = Path(args.model_path).expanduser().resolve()
+    internvl_model_path = (
+        Path(args.internvl_model_path).expanduser().resolve()
+        if args.internvl_model_path
+        else None
+    )
     out_dir = Path(args.out_dir).expanduser().resolve()
     if not data_path.is_file():
         raise SystemExit(f"ERROR: Parquet 不存在: {data_path}")
@@ -1240,11 +1391,17 @@ def main() -> None:
         raise SystemExit(f"ERROR: --data_path 必须是 VERL .parquet 文件: {data_path}")
     if not model_path.is_dir():
         raise SystemExit(f"ERROR: 模型目录不存在: {model_path}")
+    if internvl_model_path is not None and not internvl_model_path.is_dir():
+        raise SystemExit(f"ERROR: InternVL 模型目录不存在: {internvl_model_path}")
     args.data_path = str(data_path)
     args.model_path = str(model_path)
+    args.internvl_model_path = (
+        str(internvl_model_path) if internvl_model_path is not None else None
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
     local_checkpoint_path = out_dir / "rollout_results.jsonl"
     gemini_checkpoint_path = out_dir / "gemini_results.jsonl"
+    internvl_checkpoint_path = out_dir / "internvl_results.jsonl"
     trusted_gemini_checkpoint = False
     if args.reuse_gemini_dir:
         reuse_dir = Path(args.reuse_gemini_dir).expanduser().resolve()
@@ -1288,17 +1445,38 @@ def main() -> None:
             trusted_checkpoint=trusted_gemini_checkpoint,
         )
 
-    if local_checkpoint_path.exists() and not args.resume:
+    reuse_qwen = bool(
+        args.internvl_model_path
+        and local_checkpoint_path.is_file()
+        and not args.overwrite
+    )
+    if local_checkpoint_path.exists() and not args.resume and not reuse_qwen:
         local_checkpoint_path.unlink()
         print(f"覆盖本地 checkpoint: {local_checkpoint_path}")
 
+    qwen_args = copy.copy(args)
+    if reuse_qwen:
+        qwen_args.resume = True
+        print("Qwen：检测到已有 checkpoint，启用 InternVL 时直接复用。")
+
+    def run_serial_local_models() -> None:
+        run_rollout(rows, data_path, local_checkpoint_path, qwen_args)
+        if args.internvl_model_path:
+            run_internvl_rollout(
+                rows,
+                data_path,
+                internvl_checkpoint_path,
+                args,
+            )
+
     if args.gemini and not reuse_gemini:
-        print("本地模型与 Gemini 并行生成...")
+        if args.internvl_model_path:
+            print("Gemini 独立并行；本地分支按 Qwen -> InternVL 串行生成...")
+        else:
+            print("Qwen 与 Gemini 并行生成...")
         with ThreadPoolExecutor(max_workers=2) as executor:
             futures = [
-                executor.submit(
-                    run_rollout, rows, data_path, local_checkpoint_path, args
-                ),
+                executor.submit(run_serial_local_models),
                 executor.submit(
                     run_gemini_rollout,
                     rows,
@@ -1314,15 +1492,20 @@ def main() -> None:
                 future.result()
     else:
         if reuse_gemini:
-            print("Gemini：使用已有 checkpoint；重新运行本地模型...")
+            print("Gemini：使用已有 checkpoint；运行本地模型分支...")
         else:
-            print("Gemini：关闭；运行本地模型...")
-        run_rollout(rows, data_path, local_checkpoint_path, args)
+            print("Gemini：关闭；运行本地模型分支...")
+        run_serial_local_models()
 
-    print("两路生成完成。")
+    print("所有启用的生成分支均已完成。")
     has_scorable_output = any(
         (row.prediction and not row.generation_error)
         or (args.gemini and row.gemini_prediction and not row.gemini_error)
+        or (
+            args.internvl_model_path
+            and row.internvl_prediction
+            and not row.internvl_error
+        )
         for row in rows
     )
     if has_scorable_output:
@@ -1336,16 +1519,24 @@ def main() -> None:
     out_path = build_report(rows, data_path, out_dir, args)
     errors = sum(bool(row.generation_error) for row in rows)
     gemini_errors = sum(bool(row.gemini_error) for row in rows)
+    internvl_errors = sum(bool(row.internvl_error) for row in rows)
     reward_errors = sum(bool(row.evaluation_error) for row in rows)
     print(f"完成: {out_path}")
     print(f"本地 checkpoint: {local_checkpoint_path}")
     if args.gemini:
         print(f"Gemini checkpoint: {gemini_checkpoint_path}")
+    if args.internvl_model_path:
+        print(f"InternVL checkpoint: {internvl_checkpoint_path}")
     print(f"完整结果: {evaluation_path}")
     if errors:
         print(f"[WARN] {errors} 条本地生成失败；可用 --resume --retry_errors 重试")
     if gemini_errors:
         print(f"[WARN] {gemini_errors} 条 Gemini 失败；可用 --resume --retry_errors 重试")
+    if internvl_errors:
+        print(
+            f"[WARN] {internvl_errors} 条 InternVL 生成失败；"
+            "可用 --resume --retry_errors 重试"
+        )
     if reward_errors:
         print(f"[WARN] {reward_errors} 条奖励计算有失败，详情已写入 HTML/完整结果")
     print("人工标注保存在浏览器 localStorage；请在页面中导出 JSONL 备份。")

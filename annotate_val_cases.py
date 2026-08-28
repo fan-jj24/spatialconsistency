@@ -280,10 +280,13 @@ class Case:
     image_error: str = ""
     data_source: str = ""
     gemini_prediction: str = ""
+    internvl_prediction: str = ""
     local_scores: dict[str, float] = field(default_factory=dict)
     gemini_scores: dict[str, float] = field(default_factory=dict)
+    internvl_scores: dict[str, float] = field(default_factory=dict)
     evaluation_error: str = ""
     gemini_error: str = ""
+    internvl_error: str = ""
 
     @property
     def case_id(self) -> str:
@@ -826,6 +829,7 @@ button.primary { background:var(--accent); color:white; border-color:var(--accen
 .swatch { display:inline-block; width:18px; height:3px; vertical-align:3px; margin:0 4px 0 10px; }
 .swatch:first-child { margin-left:0; }
 .text-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(360px,100%),1fr)); gap:12px; margin-top:12px; }
+.text-grid.four-column { grid-template-columns:repeat(4,minmax(0,1fr)); }
 .score-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(300px,100%),1fr)); gap:12px; margin-top:12px; }
 .score-panel { border:1px solid var(--line); border-radius:6px; padding:10px; background:var(--bg); }
 .score-panel h2 { font-size:13px; margin:0 0 8px; }
@@ -847,7 +851,7 @@ textarea { width:100%; min-height:64px; margin-top:10px; resize:vertical; border
 .kbd { border:1px solid var(--line); border-bottom-width:2px; border-radius:4px; padding:0 4px; font-size:11px; }
 @media (max-width:760px) {
   .top-inner,.main { padding-left:10px; padding-right:10px; }
-  .text-grid { grid-template-columns:1fr; }
+  .text-grid,.text-grid.four-column { grid-template-columns:1fr; }
   .controls > * { flex:1 1 auto; }
   .verdicts button { flex:1; }
   pre { max-height:240px; }
@@ -987,13 +991,15 @@ function render() {
     ${c.image_error ? `<div class="error">${escapeHtml(c.image_error)}</div>` : ''}
     ${c.evaluation_error ? `<div class="error">奖励计算失败：${escapeHtml(c.evaluation_error)}</div>` : ''}
     ${c.gemini_error ? `<div class="error">Gemini 失败：${escapeHtml(c.gemini_error)}</div>` : ''}
+    ${c.internvl_error ? `<div class="error">InternVL 失败：${escapeHtml(c.internvl_error)}</div>` : ''}
     <div class="images">${imageHtml || '<div class="empty">无可用图片</div>'}</div>
     <div class="legend"><span class="swatch" style="background:#e12d2d"></span>GT：红色实线 `+
-    `<span class="swatch" style="background:#2364e1"></span>${REPORT.comparison ? '本地模型预测：蓝色虚线（Gemini 不绘框）' : '预测：蓝色虚线（全部独立绘制，不做匹配）'}</div>
-    <div class="text-grid"><div class="panel"><h2>GT</h2><pre id="gt"></pre></div>`+
-    `<div class="panel"><h2>${REPORT.comparison ? '本地模型预测' : '预测'}</h2><pre id="pred"></pre></div>`+
-    `${c.gemini || c.gemini_error ? '<div class="panel"><h2>Gemini（仅 answer + summary）</h2><pre id="gemini"></pre></div>' : ''}</div>
-    <div class="score-grid">${scorePanel('本地模型奖励',c.local_scores)}${scorePanel('Gemini 奖励',c.gemini_scores)}</div>
+    `<span class="swatch" style="background:#2364e1"></span>${REPORT.comparison ? `${REPORT.show_internvl ? 'Qwen3.5' : '本地模型预测'}：蓝色虚线（Gemini${REPORT.show_internvl ? ' / InternVL' : ''} 不绘框）` : '预测：蓝色虚线（全部独立绘制，不做匹配）'}</div>
+    <div class="text-grid ${REPORT.show_internvl ? 'four-column' : ''}"><div class="panel"><h2>GT</h2><pre id="gt"></pre></div>`+
+    `<div class="panel"><h2>${REPORT.show_internvl ? 'Qwen3.5' : (REPORT.comparison ? '本地模型预测' : '预测')}</h2><pre id="pred"></pre></div>`+
+    `${c.gemini || c.gemini_error || REPORT.show_internvl ? '<div class="panel"><h2>Gemini（仅 answer + summary）</h2><pre id="gemini"></pre></div>' : ''}`+
+    `${REPORT.show_internvl ? '<div class="panel"><h2>InternVL</h2><pre id="internvl"></pre></div>' : ''}</div>
+    <div class="score-grid">${scorePanel(REPORT.show_internvl ? 'Qwen3.5 奖励' : '本地模型奖励',c.local_scores)}${scorePanel('Gemini 奖励',c.gemini_scores)}${scorePanel('InternVL 奖励',c.internvl_scores)}</div>
     <div class="annotation"><div class="verdicts">
       <button class="verdict good ${a.prediction_verdict==='correct'?'active':''}" data-field="prediction_verdict" data-v="correct">预测正确 <span class="kbd">1</span></button>
       <button class="verdict bad ${a.prediction_verdict==='incorrect'?'active':''}" data-field="prediction_verdict" data-v="incorrect">预测错误 <span class="kbd">2</span></button>
@@ -1004,6 +1010,7 @@ function render() {
   $('gt').textContent = c.gt_display;
   $('pred').textContent = c.pred_display;
   if ($('gemini')) $('gemini').textContent = c.gemini;
+  if ($('internvl')) $('internvl').textContent = c.internvl;
   $('note').value = a.note || '';
   document.querySelectorAll('[data-field]').forEach(button => button.onclick = () =>
     setJudgment(button.dataset.field, button.dataset.v));
@@ -1059,7 +1066,8 @@ function exportJsonl() {
     data_source:c.data_source, ground_truth:c.gt, prediction:c.pred,
     gemini_prediction:c.gemini, local_scores:c.local_scores,
     gemini_scores:c.gemini_scores, evaluation_error:c.evaluation_error,
-    gemini_error:c.gemini_error
+    gemini_error:c.gemini_error, internvl_prediction:c.internvl,
+    internvl_scores:c.internvl_scores, internvl_error:c.internvl_error
   }));
   const blob = new Blob([lines.join('\n')+'\n'], {type:'application/x-ndjson;charset=utf-8'});
   const url = URL.createObjectURL(blob), a = document.createElement('a');
@@ -1133,6 +1141,7 @@ def build_html(
     subtitle: str = "",
     row_label: str = "JSONL",
     export_filename: str | None = None,
+    show_internvl_column: bool = False,
 ) -> None:
     """Build the shared interactive annotation page.
 
@@ -1145,8 +1154,10 @@ def build_html(
         digest.update(case.ground_truth.encode())
         digest.update(case.prediction.encode())
         digest.update(case.gemini_prediction.encode())
+        digest.update(case.internvl_prediction.encode())
         digest.update(_safe_script_json(case.local_scores).encode())
         digest.update(_safe_script_json(case.gemini_scores).encode())
+        digest.update(_safe_script_json(case.internvl_scores).encode())
     report_sources = list(sources) if sources is not None else list(TARGET_SOURCES)
     page_title = title or f"Step {step} 人工正确率标注"
     report = {
@@ -1157,13 +1168,17 @@ def build_html(
         "count": len(cases),
         "row_label": row_label,
         "export_filename": export_filename or f"annotations_step_{step}.jsonl",
+        "show_internvl": show_internvl_column,
         "comparison": any(
             case.gemini_prediction
             or case.gemini_error
+            or case.internvl_prediction
+            or case.internvl_error
             or case.local_scores
             or case.gemini_scores
+            or case.internvl_scores
             for case in cases
-        ),
+        ) or show_internvl_column,
     }
     payload = [{
         "id": case.case_id,
@@ -1179,11 +1194,14 @@ def build_html(
         "pred_display": (_without_3d_arrow_labels(case.prediction)
                          if case.image_paths else case.prediction),
         "gemini": case.gemini_prediction,
+        "internvl": case.internvl_prediction,
         "data_source": case.data_source,
         "local_scores": case.local_scores,
         "gemini_scores": case.gemini_scores,
+        "internvl_scores": case.internvl_scores,
         "evaluation_error": case.evaluation_error,
         "gemini_error": case.gemini_error,
+        "internvl_error": case.internvl_error,
         "images": case.image_paths,
         "image_error": case.image_error,
     } for case in cases]

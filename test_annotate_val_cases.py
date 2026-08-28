@@ -147,6 +147,36 @@ class HtmlAnnotationControlsTest(unittest.TestCase):
         self.assertIn("better_than_gemini", document)
         self.assertNotIn("不确定 <span class=\"kbd\">", document)
 
+    def test_rollout_layout_has_blank_fourth_column_without_internvl(self):
+        case = annotation.Case(
+            order=0,
+            jsonl_line=1,
+            source="dataset",
+            source_path=Path("source.jsonl"),
+            source_row=0,
+            ground_truth="gt",
+            prediction="qwen",
+            image_paths=[],
+            gemini_prediction="gemini",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "index.html"
+            annotation.build_html(
+                [case],
+                Path("rollout.jsonl"),
+                "rollout",
+                output,
+                sources=["dataset"],
+                show_internvl_column=True,
+            )
+            document = output.read_text(encoding="utf-8")
+
+        self.assertIn("four-column", document)
+        self.assertIn('<h2>InternVL</h2><pre id="internvl"></pre>', document)
+        self.assertIn('"internvl":""', document)
+        self.assertIn("' / InternVL'", document)
+        self.assertIn("internvl_prediction:c.internvl", document)
+
 
 if __name__ == "__main__":
     unittest.main()

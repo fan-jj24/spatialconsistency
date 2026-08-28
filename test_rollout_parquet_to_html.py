@@ -98,12 +98,16 @@ class GeminiConfigurationTest(unittest.TestCase):
             "--out-dir", "output",
             "--reveal-gt-answer",
             "--reuse-gemini-dir", "previous",
+            "--internvl-model-path", "internvl",
+            "--internvl-batch-size", "2",
         ]
         with patch.object(sys, "argv", argv):
             args = rollout.parse_args()
 
         self.assertTrue(args.reveal_gt_answer)
         self.assertEqual(args.reuse_gemini_dir, "previous")
+        self.assertEqual(args.internvl_model_path, "internvl")
+        self.assertEqual(args.internvl_batch_size, 2)
         self.assertEqual(
             args.gemini_oss_prefix, "yk/ai-material/neo/fjj/rollout"
         )
@@ -148,6 +152,96 @@ class GeminiCheckpointReuseTest(unittest.TestCase):
 
         self.assertEqual(row.gemini_prediction, checkpoint["gemini_prediction"])
         self.assertEqual(row.gemini_error, "")
+
+
+class InternVLCheckpointTest(unittest.TestCase):
+    def test_reuses_separate_internvl_checkpoint_without_loading_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint_path = Path(directory) / "internvl_results.jsonl"
+            row = rollout.EvalRow(
+                order=0,
+                source_row=7,
+                row={},
+                ground_truth='{"answer":"A"}',
+                local_data_source=rollout.LOCAL_DATA_SOURCE,
+                gemini_data_source=rollout.GEMINI_DATA_SOURCE,
+                internvl_prediction='{"answer":"A","summary":"internvl"}',
+            )
+            args = SimpleNamespace(
+                internvl_model_path="internvl-model",
+                internvl_batch_size=1,
+                model_path="qwen-model",
+                data_path="data.parquet",
+                seed=42,
+                generation_seed=42,
+                batch_size=10,
+                dtype="bfloat16",
+                max_prompt_length=2048,
+                temperature=0.01,
+                top_p=1.0,
+                top_k=-1,
+                repetition_penalty=1.0,
+                max_new_tokens=4096,
+                reveal_gt_answer=False,
+                retry_errors=False,
+            )
+            internvl_args = SimpleNamespace(**vars(args))
+            internvl_args.model_path = args.internvl_model_path
+            internvl_args.batch_size = args.internvl_batch_size
+            rollout._append_checkpoint(
+                checkpoint_path,
+                row,
+                internvl_args,
+                prediction_attr="internvl_prediction",
+                error_attr="internvl_error",
+            )
+            row.internvl_prediction = ""
+
+            with patch.object(
+                rollout,
+                "TransformersRollout",
+                side_effect=AssertionError("checkpoint reuse must not load model"),
+            ):
+                rollout.run_internvl_rollout(
+                    [row], Path("data.parquet"), checkpoint_path, args
+                )
+
+        self.assertEqual(
+            row.internvl_prediction,
+            '{"answer":"A","summary":"internvl"}',
+        )
+        self.assertEqual(row.internvl_error, "")
+
+
+class InternVLRewardTest(unittest.TestCase):
+    def test_scores_internvl_with_local_reward_route(self):
+        row = rollout.EvalRow(
+            order=0,
+            source_row=1,
+            row={},
+            ground_truth="gt",
+            local_data_source=rollout.LOCAL_DATA_SOURCE,
+            gemini_data_source=rollout.GEMINI_DATA_SOURCE,
+            internvl_prediction="internvl output",
+        )
+        args = SimpleNamespace(
+            gemini=False,
+            internvl_model_path="internvl-model",
+            reward_workers=1,
+        )
+        with patch.object(
+            rollout.reward,
+            "compute_score_details",
+            return_value={"reward": 0.75},
+        ) as scorer:
+            rollout.calculate_rewards([row], args)
+
+        scorer.assert_called_once_with(
+            rollout.LOCAL_DATA_SOURCE,
+            "internvl output",
+            "gt",
+        )
+        self.assertEqual(row.internvl_scores, {"reward": 0.75})
 
 
 if __name__ == "__main__":
