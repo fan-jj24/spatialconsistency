@@ -56,10 +56,12 @@ def _is_transient(err_text: str) -> bool:
 
 
 def call_idealab(api_key: str, system_prompt: str, user_content: List[Dict],
-                 max_retries: int = 3, thinking_level: str = "high") -> Dict:
+                 max_retries: int = 3, thinking_level: str = "high",
+                 model: str = MODEL) -> Dict:
     """
     调用 idealab OpenAI 兼容接口, 带重试。
-    thinking_level: "low" / "medium" / "high" (gemini-3.5 无法关闭 thinking)
+    ``model`` 允许同一 idealab 端点和 API key 调用不同模型。
+    ``thinking_level`` 由调用方按模型能力传入。
     返回 {"ok": True, "text": ...} 或 {"ok": False, "error": ...}
     """
     messages = [
@@ -67,11 +69,11 @@ def call_idealab(api_key: str, system_prompt: str, user_content: List[Dict],
         {"role": "user", "content": user_content},
     ]
     payload = {
-        "model": MODEL,
+        "model": model,
         "max_tokens": MAX_TOKENS,
         "messages": messages,
     }
-    # thinking 参数: Gemini 3 官方写法 (gemini-3.5 无法关闭 thinking, 默认 high)
+    # idealab 上 Gemini/Qwen 都接受这个 thinking_config 形式。
     payload["thinking_config"] = {"thinking_level": thinking_level}
     headers = {
         "Authorization": f"Bearer {api_key}",

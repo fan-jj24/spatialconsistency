@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 import evaluate_rollout_checkpoints as evaluator
+import run_gemini
 import rollout_checkpoint as rollout
 import rollout_parquet_to_html as legacy
 
@@ -31,7 +32,7 @@ def make_args(**changes):
         top_k=-1,
         repetition_penalty=1.0,
         reveal_gt_answer=False,
-        gemini_thinking_level="high",
+        remote_model=legacy.GEMINI_MODEL,
     )
     values.update(changes)
     return SimpleNamespace(**values)
@@ -49,6 +50,41 @@ def make_row(source_row, order):
 
 
 class CheckpointFormatTest(unittest.TestCase):
+    def test_remote_model_routes_maximum_thinking_level(self):
+        self.assertEqual(
+            rollout.remote_model_config("gemini-3.5-flash"),
+            rollout.RemoteModelConfig("gemini", "high"),
+        )
+        self.assertEqual(
+            rollout.remote_model_config("Qwen3.8-Flash-Next"),
+            rollout.RemoteModelConfig("qwen_idealab", "xhigh"),
+        )
+        with self.assertRaisesRegex(ValueError, "仅支持"):
+            rollout.remote_model_config("some-other-model")
+
+    def test_remote_metadata_uses_selected_api_model(self):
+        metadata = rollout.checkpoint_metadata(
+            make_args(
+                mode="remote", model_path=None,
+                remote_model="Qwen3.8-Flash-Next",
+            )
+        )
+        self.assertEqual(metadata["backend"], "qwen_idealab")
+        self.assertEqual(metadata["remote_model"], "Qwen3.8-Flash-Next")
+        self.assertEqual(metadata["remote_thinking_level"], "xhigh")
+
+    def test_gemini_metadata_schema_and_resume_are_unchanged(self):
+        args = make_args(mode="remote", name="gemini", model_path=None)
+        row = make_row(7, 0)
+        saved = {
+            **rollout.checkpoint_metadata(args),
+            "source_row": row.source_row,
+            "ground_truth": row.ground_truth,
+        }
+        self.assertEqual(saved["gemini_thinking_level"], "high")
+        self.assertNotIn("remote_thinking_level", saved)
+        rollout.validate_checkpoint({row.source_row: saved}, [row], args)
+
     def test_route_prefix_and_safe_name(self):
         self.assertEqual(
             rollout.checkpoint_filename("local", "qwen.step-10"),
@@ -97,7 +133,6 @@ class DynamicEvaluationTest(unittest.TestCase):
                 directory,
                 make_args(
                     mode="remote", name="gemini", model_path=None,
-                    gemini_thinking_level="high",
                 ),
                 [(10, "remote-10"), (11, "remote-11")],
             )
@@ -136,6 +171,39 @@ class DynamicEvaluationTest(unittest.TestCase):
         for index in range(4):
             self.assertIn(f"local:model_{index}", document)
         self.assertIn("本条最佳", document)
+
+
+class IdealabRequestTest(unittest.TestCase):
+    def test_default_request_remains_gemini_high(self):
+        response = SimpleNamespace(
+            status_code=200,
+            json=lambda: {"choices": [{"message": {"content": "ok"}}]},
+            text="",
+        )
+        with patch.object(run_gemini.requests, "post", return_value=response) as post:
+            result = run_gemini.call_idealab("shared-key", "system", [])
+
+        self.assertTrue(result["ok"])
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["model"], run_gemini.MODEL)
+        self.assertEqual(payload["thinking_config"], {"thinking_level": "high"})
+
+    def test_selected_model_is_sent_to_idealab(self):
+        response = SimpleNamespace(
+            status_code=200,
+            json=lambda: {"choices": [{"message": {"content": "ok"}}]},
+            text="",
+        )
+        with patch.object(run_gemini.requests, "post", return_value=response) as post:
+            result = run_gemini.call_idealab(
+                "shared-key", "system", [], model="Qwen3.8-Flash-Next",
+                thinking_level="xhigh",
+            )
+
+        self.assertTrue(result["ok"])
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["model"], "Qwen3.8-Flash-Next")
+        self.assertEqual(payload["thinking_config"], {"thinking_level": "xhigh"})
 
 
 if __name__ == "__main__":

@@ -11,9 +11,14 @@ Examples::
     python rollout_checkpoint.py --mode local --name internvl_baseline --internvl \
       --model-path /models/internvl --data-path train.parquet --out-dir checkpoints
 
-    # Remote Gemini
+    # Remote Gemini (default model)
     python rollout_checkpoint.py --mode remote --name gemini_35 \
       --data-path train.parquet --out-dir checkpoints
+
+    # Remote Qwen3.8 Flash through the same idealab API/key
+    python rollout_checkpoint.py --mode remote --name qwen_38_flash \
+      --remote-model Qwen3.8-Flash --data-path train.parquet \
+      --out-dir checkpoints
 
 The output is ``<mode>__<name>.jsonl``.  Existing checkpoints are resumed by
 default.  Use ``--retry-errors`` to retry failed rows or ``--overwrite`` to
@@ -24,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import re
@@ -35,6 +41,24 @@ import rollout_parquet_to_html as legacy
 
 SCHEMA_VERSION = 1
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+@dataclass(frozen=True)
+class RemoteModelConfig:
+    backend: str
+    thinking_level: str
+
+
+def remote_model_config(model: str) -> RemoteModelConfig:
+    """Route supported idealab model names to their maximum thinking level."""
+    normalized = re.sub(r"[^a-z0-9]", "", model.lower())
+    if "gemini" in normalized:
+        return RemoteModelConfig(backend="gemini", thinking_level="high")
+    if "qwen38" in normalized and "flash" in normalized:
+        return RemoteModelConfig(backend="qwen_idealab", thinking_level="xhigh")
+    raise ValueError(
+        "--remote-model 目前仅支持 Gemini 或 Qwen3.8 Flash 模型名"
+    )
 
 
 def checkpoint_filename(mode: str, name: str) -> str:
@@ -67,10 +91,15 @@ def read_checkpoint(path: Path) -> dict[int, dict[str, Any]]:
 
 
 def checkpoint_metadata(args: argparse.Namespace) -> dict[str, Any]:
-    backend = "gemini" if args.mode == "remote" else (
-        "internvl" if args.internvl else "qwen"
+    remote_config = (
+        remote_model_config(args.remote_model) if args.mode == "remote" else None
     )
-    return {
+    backend = (
+        remote_config.backend
+        if remote_config is not None
+        else ("internvl" if args.internvl else "qwen")
+    )
+    metadata = {
         "schema_version": SCHEMA_VERSION,
         "mode": args.mode,
         "name": args.name,
@@ -91,11 +120,16 @@ def checkpoint_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "top_k": args.top_k,
         "repetition_penalty": args.repetition_penalty,
         "reveal_gt_answer": args.reveal_gt_answer,
-        "remote_model": legacy.GEMINI_MODEL if args.mode == "remote" else None,
-        "gemini_thinking_level": (
-            args.gemini_thinking_level if args.mode == "remote" else None
-        ),
+        "remote_model": args.remote_model if args.mode == "remote" else None,
     }
+    if remote_config is None or remote_config.backend == "gemini":
+        # Preserve the established local/Gemini checkpoint schema exactly.
+        metadata["gemini_thinking_level"] = (
+            remote_config.thinking_level if remote_config is not None else None
+        )
+    else:
+        metadata["remote_thinking_level"] = remote_config.thinking_level
+    return metadata
 
 
 def validate_checkpoint(
@@ -106,9 +140,10 @@ def validate_checkpoint(
     expected = checkpoint_metadata(args)
     selected = {row.source_row: row for row in rows}
     for source_row, saved in completed.items():
-        mismatched = [
-            key for key, value in expected.items() if saved.get(key) != value
-        ]
+        mismatched = []
+        for key, value in expected.items():
+            if saved.get(key) != value:
+                mismatched.append(key)
         if source_row not in selected:
             mismatched.append("source_row(不在本次抽样中)")
         elif saved.get("ground_truth") != selected[source_row].ground_truth:
@@ -197,6 +232,7 @@ def run_remote(
     out_dir: Path,
     args: argparse.Namespace,
 ) -> None:
+    config = remote_model_config(args.remote_model)
     gemini = legacy._gemini_module()
     credentials = legacy._load_gemini_credentials()
     oss_handler = gemini.OuterOSSHandle(
@@ -213,7 +249,8 @@ def run_remote(
                 legacy.GEMINI_SYSTEM_PROMPT,
                 content,
                 max_retries=args.gemini_max_retries,
-                thinking_level=args.gemini_thinking_level,
+                thinking_level=config.thinking_level,
+                model=args.remote_model,
             )
             if not result.get("ok"):
                 return "", str(result.get("error", "unknown remote error"))
@@ -250,6 +287,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--out-dir", required=True, help="checkpoint 输出目录")
     parser.add_argument("--model-path", help="local 模型目录；remote 模式不需要")
     parser.add_argument(
+        "--remote-model", default=legacy.GEMINI_MODEL,
+        help=(
+            "idealab API 模型名；目前支持 Gemini（自动 high）和 "
+            "Qwen3.8 Flash（自动 xhigh）"
+        ),
+    )
+    parser.add_argument(
         "--internvl", action="store_true",
         help="local 模式使用 InternVL；不指定时默认按 Qwen 加载",
     )
@@ -279,9 +323,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--remote-workers", type=int, default=10)
     parser.add_argument("--gemini-max-retries", type=int, default=3)
     parser.add_argument(
-        "--gemini-thinking-level", choices=("low", "medium", "high"), default="high"
-    )
-    parser.add_argument(
         "--gemini-oss-prefix", default="yk/ai-material/neo/fjj/rollout"
     )
     parser.add_argument("--gemini-max-image-edge", type=int, default=2048)
@@ -298,6 +339,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("remote 模式不使用 --model-path")
     if args.mode == "remote" and args.internvl:
         parser.error("--internvl 只能用于 local 模式")
+    if args.mode == "remote":
+        try:
+            remote_model_config(args.remote_model)
+        except ValueError as exc:
+            parser.error(str(exc))
     if args.num_samples <= 0 or args.batch_size <= 0 or args.remote_workers <= 0:
         parser.error("num-samples、batch-size、remote-workers 必须大于 0")
     if args.max_prompt_length <= 0 or args.max_new_tokens <= 0:
@@ -307,7 +353,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.repetition_penalty <= 0:
         parser.error("repetition-penalty 必须大于 0")
     if args.gemini_max_retries <= 0 or args.gemini_max_image_edge < 128:
-        parser.error("Gemini 重试次数必须大于 0，图片最长边不能小于 128")
+        parser.error("remote 重试次数必须大于 0，图片最长边不能小于 128")
     if not 30 <= args.jpeg_quality <= 100:
         parser.error("jpeg-quality 必须在 30 到 100 之间")
     return args
