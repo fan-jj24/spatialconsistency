@@ -2,9 +2,9 @@
 # ============================================================
 # RL1 正式训练脚本 — verl 0.8.0 DAPO recipe
 #
-# 权重: /home/deepspeed/model_output/Qwen_SFT
-# 数据: /home/deepspeed/model_output/RL1 (5 个数据集目录)
-# 训练: 5 epoch, LR=5e-7, warmup 10 步, ppo_epochs=1
+# 权重: /home/deepspeed/model_output/Qwen_qwen_SFT
+# 数据: /home/deepspeed/model_output/RL_qwen (5 个数据集目录)
+# 训练: 5 epoch, LR=5e-6, warmup 50 步, ppo_epochs=1
 #
 # 关键配置:
 #   - ppo_epochs=1: 每个 rollout batch 只做一次策略更新，
@@ -14,13 +14,13 @@
 #      0.7 可多腾出 ~4.8 GiB, 预计够用; 若仍 OOM 降到 0.65)
 #   - filter_overlong_prompts=False: 不做耗时的逐条长度过滤，
 #     超过 max_prompt_length=1600 的 prompt 从左侧截断
-#   - FREEZE_VISION=1 可选: 冻结 vision tower
+#   - FREEZE_VISION=1（默认）: 冻结 vision tower
 #     (依赖已打过的 patch_freeze_vision_sft.py 补丁)
 #
 # 用法:
 #   bash rl.sh                        # 全参数训练
-#   FREEZE_VISION=1 bash rl.sh        # 冻结 vision（推荐）
-#   FREEZE_VISION=1 bash rl.sh --eval-train-samples
+#   FREEZE_VISION=0 bash rl.sh        # 如需训练 vision tower，可显式解冻
+#   bash rl.sh --eval-train-samples
 #                                      # 验证集额外加入每个数据集的 200 条训练样本
 # ============================================================
 
@@ -53,7 +53,7 @@ R4_SERVER_PYTHON=${R4_SERVER_PYTHON:-python3}
 export R4_MODEL_LOCAL_PATH=${R4_MODEL_LOCAL_PATH:-"/home/deepspeed/model_output/Qwen"}
 R4_SERVER_HOST=${R4_SERVER_HOST:-127.0.0.1}
 R4_SERVER_PORT=${R4_SERVER_PORT:-8765}
-# 一对 summary 对应一条四分类模型输入；动态攒 32 条送入 vLLM。
+# R4/reasoning gate 各自攒批，均最多 32 条、等待 20ms；等待数多者先推理。
 R4_SERVER_MAX_BATCH_SIZE=${R4_SERVER_MAX_BATCH_SIZE:-32}
 R4_SERVER_MAX_WAIT_MS=${R4_SERVER_MAX_WAIT_MS:-20}
 R4_SERVER_STARTUP_TIMEOUT=${R4_SERVER_STARTUP_TIMEOUT:-600}
@@ -68,6 +68,7 @@ export R4_VLLM_KV_CACHE_BYTES=${R4_VLLM_KV_CACHE_BYTES:-1073741824}
 export R4_VLLM_GPU_MEMORY_UTILIZATION=${R4_VLLM_GPU_MEMORY_UTILIZATION:-0.08}
 export R4_VLLM_MAX_NUM_SEQS=${R4_VLLM_MAX_NUM_SEQS:-${R4_SERVER_MAX_BATCH_SIZE}}
 export R4_VLLM_LOGPROBS=${R4_VLLM_LOGPROBS:-128}
+export REASONING_GATE_MAX_SENTENCE_TOKENS=${REASONING_GATE_MAX_SENTENCE_TOKENS:-128}
 R4_VLLM_WORKER_MULTIPROC_METHOD=${R4_VLLM_WORKER_MULTIPROC_METHOD:-spawn}
 
 # 5 个数据集目录
@@ -153,7 +154,7 @@ NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-128}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-32}
 ROLLOUT_N=${ROLLOUT_N:-8}
-# 2 epoch; ppo_epochs=1 保证每个样本每 epoch 只迭代一次
+# 5 epoch；ppo_epochs=1 保证每个 rollout batch 只做一次策略更新
 TOTAL_EPOCHS=${TOTAL_EPOCHS:-5}
 
 # ---- 动态 batching ----
@@ -178,7 +179,7 @@ TEST_FREQ=${TEST_FREQ:-10}
 VAL_MAX_SAMPLES=${VAL_MAX_SAMPLES:-0}
 
 # ---- 学习率 & KL ----
-# LR=5e-6, warmup 固定 10 步
+# LR=5e-6，warmup 固定 50 步
 ACTOR_LR=${ACTOR_LR:-5e-6}
 ACTOR_LR_WARMUP_STEPS=${ACTOR_LR_WARMUP_STEPS:-50}
 KL_COEF=${KL_COEF:-0.0}
@@ -244,9 +245,10 @@ echo "============================================================"
 echo "  模型:           ${MODEL_PATH}"
 echo "  数据根目录:     ${DATA_ROOT}"
 echo "  Reward:         ${REWARD_FILE}"
-echo "  R4 service:     ${R4_REWARD_URL} (batch=${R4_SERVER_MAX_BATCH_SIZE}, wait=${R4_SERVER_MAX_WAIT_MS}ms)"
-echo "  R4 model:       ${R4_MODEL_LOCAL_PATH} (Qwen3.5-9B, vLLM BF16 TP=${R4_VLLM_TENSOR_PARALLEL_SIZE})"
-echo "  R4 GPUs:        ${R4_CUDA_VISIBLE_DEVICES} (eager, KV cache=${R4_VLLM_KV_CACHE_BYTES} bytes/GPU)"
+echo "  Reward service: ${R4_REWARD_URL} (R4/gate 分队列，共用 ${R4_SERVER_MAX_BATCH_SIZE}/${R4_SERVER_MAX_WAIT_MS}ms，等待数多者优先)"
+echo "  Reward model:   ${R4_MODEL_LOCAL_PATH} (共享 Qwen3.5-9B, vLLM BF16 TP=${R4_VLLM_TENSOR_PARALLEL_SIZE})"
+echo "  Reward GPUs:    ${R4_CUDA_VISIBLE_DEVICES} (eager, KV cache=${R4_VLLM_KV_CACHE_BYTES} bytes/GPU)"
+echo "  Reasoning gate: hard 0/1, sentence<=${REASONING_GATE_MAX_SENTENCE_TOKENS} tokens"
 echo "  Epochs:         ${TOTAL_EPOCHS} (ppo_epochs=1, 样本不重复迭代)"
 echo "  LR:             ${ACTOR_LR} (warmup steps=${ACTOR_LR_WARMUP_STEPS})"
 echo "  Batch:          train=${TRAIN_BATCH_SIZE}, mini=${PPO_MINI_BATCH_SIZE}, rollout_n=${ROLLOUT_N}"
@@ -417,7 +419,7 @@ ALGO=(
     algorithm.use_kl_in_reward=False
     algorithm.kl_ctrl.kl_coef=${KL_COEF}
     algorithm.filter_groups.enable=True
-    algorithm.filter_groups.metric=acc
+    algorithm.filter_groups.metric=score
     algorithm.filter_groups.max_num_gen_batches=${MAX_NUM_GEN_BATCHES}
 )
 
@@ -428,7 +430,7 @@ REWARD=(
     reward.reward_kwargs.overlong_buffer_cfg.penalty_factor=${OVERLONG_PENALTY_FACTOR}
     reward.reward_kwargs.max_resp_len=${MAX_RESPONSE_LENGTH}
     custom_reward_function.path="${REWARD_FILE}"
-    custom_reward_function.name=compute_score
+    custom_reward_function.name=compute_score_with_reasoning_gate
 )
 
 # --- Trainer ---
@@ -451,9 +453,9 @@ TRAINER=(
 )
 
 # ------------------------------------------------------------
-# 启动中央 R4 动态批处理服务
+# 启动中央 R4/reasoning-gate 共享模型动态批处理服务
 # ------------------------------------------------------------
-echo "启动 R4 reward service，日志: ${R4_SERVER_LOG}"
+echo "启动共享 reward service，日志: ${R4_SERVER_LOG}"
 CUDA_VISIBLE_DEVICES="${R4_CUDA_VISIBLE_DEVICES}" \
 VLLM_WORKER_MULTIPROC_METHOD="${R4_VLLM_WORKER_MULTIPROC_METHOD}" \
 "${R4_SERVER_PYTHON}" "${R4_SERVER_FILE}" \
@@ -498,7 +500,7 @@ PY
     fi
     sleep 1
 done
-echo "R4 reward service 已就绪 (pid=${R4_SERVER_PID})"
+echo "共享 reward service 已就绪 (pid=${R4_SERVER_PID})"
 
 # ------------------------------------------------------------
 # 启动训练
