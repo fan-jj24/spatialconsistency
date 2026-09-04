@@ -90,7 +90,8 @@ JSON RLVR Reward Function（分类奖励框架）
 
 ━━━ R4 子项详解（第三、四类共用）━━━
   R4（summary 一致性校验，Qwen3.5-9B 奖励模型）:
-    使用 Qwen/Qwen3.5-9B 作为判官，运行在 CPU 上，
+    使用 Qwen/Qwen3.5-9B 作为判官，通过 vLLM 以 BF16 在 GPU 上推理
+    （默认 tensor parallel=8），
     校验模型输出的 summary 与 GT summary 是否语义一致。
     模型加载和推理封装在中央 reward_model_server.py 服务中，本文件通过
     同目录 reward_model_client.py 发起单条 HTTP 请求，由服务动态攒批。
@@ -100,7 +101,8 @@ JSON RLVR Reward Function（分类奖励框架）
     完全符合、部分符合（仅遗漏）、部分不符合（有正确内容也有错误）、
     完全不符合；对应权重为 1、0.5、0.25、0，由中央服务中的 9B
     模型批量判断。
-    性能: CPU bfloat16，由中央服务动态合批
+    性能: GPU vLLM BF16，R4 与 reasoning gate 共享模型实例，
+          由中央服务分队列动态合批
 
     输入: pred summary（从模型输出 JSON 的 summary 键提取）
           gt summary（从 GT JSON 的 summary 键提取）
