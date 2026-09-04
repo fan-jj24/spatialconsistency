@@ -934,7 +934,9 @@ INCONSISTENT_COT_GEMINI_EVAL_SOURCE = "inconsistent_cot_gemini_eval"
 
 JSON_ANSWER_SOURCES = {
     "spatial_consistency_pos",
+    "spatial_consistency_pos_train",
     "spatial_consistency_neg",
+    "spatial_consistency_neg_train",
     # 其余第一类数据源（run_rl1.sh 中使用）
     "vst_caption",
     "spatialscore",
@@ -942,14 +944,21 @@ JSON_ANSWER_SOURCES = {
     "viewspatial",
     "vst_oor",
 }
-
+""
 HUNGARIAN_IOU_SOURCES = {
     "humanref_cot",
 }
 
 SPATIAL_CONSISTENCY_BBOX_SOURCES = {
     "spatial_consistency_bbox_pos",
+    "spatial_consistency_bbox_pos_train",
     "spatial_consistency_bbox_neg",
+    "spatial_consistency_bbox_neg_train",
+    "inconsistent_qwen_eval",
+    "inconsistent_qwen",
+    "consistent_qwen_eval",
+    "consistent_qwen",
+    
     # rollout_parquet_to_html.py 只评测 inconsistent CoT 数据。本地路由
     # 计算 C/R2/R3/R4/reward，不依赖输入 Parquet 的 data_source。
     INCONSISTENT_COT_LOCAL_EVAL_SOURCE,
@@ -963,6 +972,9 @@ ANSWER_SUMMARY_EVAL_SOURCES = {
 
 SPATIAL_DETECTION_SOURCES = {
     "spatial_detection",
+    "spatial_detection_train",
+    "detection_qwen_eval",
+    "detection_qwen",
 }
 
 KNOWN_SOURCES = (JSON_ANSWER_SOURCES | HUNGARIAN_IOU_SOURCES
