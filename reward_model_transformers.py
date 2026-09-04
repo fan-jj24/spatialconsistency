@@ -27,6 +27,7 @@ class TransformersRewardModel:
         self._device = None
         self._choice_token_ids = None
         self._load_lock = threading.Lock()
+        self._infer_lock = threading.Lock()
 
     @staticmethod
     def _normalize_summary(summary):
@@ -108,7 +109,8 @@ class TransformersRewardModel:
             model.eval()
 
             choice_token_ids = []
-            for letter in self._config.CHOICE_LETTERS:
+            all_letters = (*self._config.CHOICE_LETTERS, "U")
+            for letter in all_letters:
                 token_ids = tokenizer.encode(letter, add_special_tokens=False)
                 if len(token_ids) != 1:
                     raise RuntimeError(
@@ -127,7 +129,7 @@ class TransformersRewardModel:
                     )
                 choice_token_ids.append(token_id)
             if len(set(choice_token_ids)) != len(choice_token_ids):
-                raise RuntimeError(f"A/B/C/D token 不唯一: {choice_token_ids!r}")
+                raise RuntimeError(f"A/B/C/D/U token 不唯一: {choice_token_ids!r}")
 
             self._torch = torch
             self._tokenizer = tokenizer
@@ -165,6 +167,15 @@ class TransformersRewardModel:
         )
         return self._tokenizer.decode(token_ids, skip_special_tokens=True)
 
+    def _truncate_conclusion(self, sentence):
+        token_ids = self._tokenizer.encode(
+            sentence,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=self._config.R5_MAX_SENTENCE_TOKENS,
+        )
+        return self._tokenizer.decode(token_ids, skip_special_tokens=True)
+
     def _build_prompt(self, pred_summary, gt_summary):
         messages = [
             {"role": "system", "content": self._config.SYSTEM_PROMPT},
@@ -183,7 +194,24 @@ class TransformersRewardModel:
             enable_thinking=False,
         )
 
-    def _infer_scores(self, prompts):
+    def _build_r5_prompt(self, sentence):
+        messages = [
+            {"role": "system", "content": self._config.R5_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": self._config.R5_INPUT_TEMPLATE.format(
+                    sentence=sentence
+                ),
+            },
+        ]
+        return self._tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+
+    def _infer_probabilities(self, prompts, letters, task_name):
         encoded = self._tokenizer(
             prompts,
             padding=True,
@@ -194,12 +222,12 @@ class TransformersRewardModel:
         for index, length in enumerate(lengths):
             if length > self._config.MAX_INPUT_TOKENS:
                 raise RuntimeError(
-                    f"R4 prompt {index} 截断后仍有 {length} tokens，超过 "
+                    f"{task_name} prompt {index} 截断后仍有 {length} tokens，超过 "
                     f"R4_MAX_INPUT_TOKENS={self._config.MAX_INPUT_TOKENS}；"
                     "请减小 R4_MAX_SUMMARY_TOKENS"
                 )
         encoded = {key: value.to(self._device) for key, value in encoded.items()}
-        with self._torch.inference_mode():
+        with self._infer_lock, self._torch.inference_mode():
             generated = self._model.generate(
                 **encoded,
                 max_new_tokens=1,
@@ -210,9 +238,14 @@ class TransformersRewardModel:
                 pad_token_id=self._tokenizer.pad_token_id,
             )
         if not generated.logits or len(generated.logits) != 1:
-            raise RuntimeError("Transformers R4 未返回一个 token 的原始 logits")
+            raise RuntimeError(
+                f"Transformers {task_name} 未返回一个 token 的原始 logits"
+            )
         next_token_logits = generated.logits[0].float()
-        choice_logits = next_token_logits[:, self._choice_token_ids]
+        all_letters = (*self._config.CHOICE_LETTERS, "U")
+        token_id_by_letter = dict(zip(all_letters, self._choice_token_ids))
+        selected_token_ids = [token_id_by_letter[letter] for letter in letters]
+        choice_logits = next_token_logits[:, selected_token_ids]
         choice_probabilities = self._torch.softmax(choice_logits, dim=-1)
 
         log_normalizer = self._torch.logsumexp(next_token_logits, dim=-1)
@@ -226,22 +259,28 @@ class TransformersRewardModel:
                 or mass < self._config.MIN_CHOICE_MASS
             ):
                 raise RuntimeError(
-                    f"R4 prompt {index} 的 A/B/C/D 总概率 {mass:.6g} 低于 "
+                    f"{task_name} prompt {index} 的标签总概率 {mass:.6g} 低于 "
                     f"R4_MIN_CHOICE_MASS={self._config.MIN_CHOICE_MASS:.6g}"
                 )
 
-        weights = self._torch.tensor(
-            self._config.CHOICE_WEIGHTS,
-            dtype=choice_probabilities.dtype,
-            device=choice_probabilities.device,
-        )
         return (
-            (choice_probabilities * weights)
-            .sum(dim=-1)
-            .detach()
-            .cpu()
-            .tolist()
+            choice_probabilities.detach().cpu().tolist(),
+            choice_masses,
         )
+
+    def _infer_scores(self, prompts):
+        probabilities, _ = self._infer_probabilities(
+            prompts, self._config.CHOICE_LETTERS, "R4"
+        )
+        return [
+            sum(
+                probability * weight
+                for probability, weight in zip(
+                    row, self._config.CHOICE_WEIGHTS
+                )
+            )
+            for row in probabilities
+        ]
 
     def score_summary(self, pred_summary, gt_summary):
         return self.score_summaries([(pred_summary, gt_summary)])[0]
@@ -283,6 +322,63 @@ class TransformersRewardModel:
             raise RuntimeError("Transformers R4 返回数量错误")
         for (index, _, _), score in zip(pending, scores):
             results[index] = float(score)
+        return results
+
+    def score_conclusion(self, sentence, expected_stance):
+        return self.score_conclusions([(sentence, expected_stance)])[0]
+
+    def score_conclusions(self, pairs):
+        if not pairs:
+            return []
+        normalized_pairs = []
+        for index, pair in enumerate(pairs):
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                raise TypeError(
+                    f"pairs[{index}] 必须是 (sentence, expected_stance)"
+                )
+            sentence, expected_stance = pair
+            if not isinstance(sentence, str) or not isinstance(expected_stance, str):
+                raise TypeError(f"pairs[{index}] 的 R5 输入必须都是字符串")
+            expected_stance = expected_stance.strip().lower()
+            if expected_stance not in {"consistent", "inconsistent"}:
+                raise ValueError(
+                    f"pairs[{index}] 的 expected_stance 无效: "
+                    f"{expected_stance!r}"
+                )
+            if not sentence.strip():
+                raise ValueError(f"pairs[{index}] 的最后一句为空")
+            normalized_pairs.append((sentence, expected_stance))
+
+        self._ensure_loaded()
+        prompts = [
+            self._build_r5_prompt(self._truncate_conclusion(sentence))
+            for sentence, _ in normalized_pairs
+        ]
+        probabilities, choice_masses = self._infer_probabilities(
+            prompts, self._config.R5_CHOICE_LETTERS, "R5"
+        )
+        results = []
+        for (_, expected_stance), row, choice_mass in zip(
+            normalized_pairs, probabilities, choice_masses
+        ):
+            consistent_p, inconsistent_p, unclear_p = [float(x) for x in row]
+            conflict_probability = (
+                inconsistent_p
+                if expected_stance == "consistent"
+                else consistent_p
+            )
+            gate = 1.0 - (
+                1.0 - self._config.R5_CONFLICT_GATE
+            ) * conflict_probability
+            results.append(
+                self._config.ConclusionScore(
+                    gate=max(0.0, min(1.0, float(gate))),
+                    conflict_probability=float(conflict_probability),
+                    unclear_probability=unclear_p,
+                    probabilities=(consistent_p, inconsistent_p, unclear_p),
+                    choice_mass=float(choice_mass),
+                )
+            )
         return results
 
 

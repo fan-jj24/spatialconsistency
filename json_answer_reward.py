@@ -110,6 +110,15 @@ JSON RLVR Reward Function（分类奖励框架）
     在第三/四类中的权重:
       第三类: R = C × (0.1 + 0.25×R2 + 0.25×R3 + 0.4×R4)
       第四类: R = 0.25×R2 + 0.25×R3 + 0.5×R4
+
+━━━ R5 训练门控（仅二元空间一致性 CoT）━━━
+  从 ``</think>`` 前只提取最后一句，Qwen3.5-9B 判断该句最终表达的是
+  consistent / inconsistent / U。R4 与 R5 共享同一模型实例，但使用独立
+  动态 batch 队列。R5 只在 answer 正确时调用：
+    gate = 1 - 0.5 × P(明确相反)
+    reward = max(base_reward, 0) × gate + min(base_reward, 0)
+  U 不处罚；thinking 缺失或无法提取最后一句时 gate=0。
+  DAPO 返回字段中的 acc 始终保留原始 answer 0/1。
 ━━━ 设计约束 ━━━
   - 第一类保持严格 0/1 二值: DAPO 的 filter_groups.metric=acc 依赖
     组内二值对错来过滤全对/全错 group。
@@ -128,7 +137,7 @@ verl 调用签名:
 
 在 verl 配置中注册:
     custom_reward_function.path = /path/to/json_answer_reward.py
-    custom_reward_function.name = compute_score
+    custom_reward_function.name = compute_score_r5
 """
 
 import importlib.util
@@ -145,6 +154,7 @@ from scipy.optimize import linear_sum_assignment
 # 用文件路径导入，避免 verl 从任意工作目录动态加载本文件时找不到同目录的
 # reward_model_client.py，也避免误导入环境中另一个同名模块。
 _r4_score_summary_fn = None
+_r5_score_conclusion_fn = None
 _r4_import_lock = threading.Lock()
 _R4_MODULE_NAME = "_spatialconsistency_r4_reward_model_client"
 
@@ -190,6 +200,27 @@ def _get_r4_score_summary():
             )
         _r4_score_summary_fn = score_fn
         return _r4_score_summary_fn
+
+
+def _get_r5_score_conclusion():
+    """从共享客户端懒加载 R5；失败时禁止静默退回旧奖励。"""
+    global _r5_score_conclusion_fn
+    if _r5_score_conclusion_fn is not None:
+        return _r5_score_conclusion_fn
+
+    # 复用 R4 的模块加载逻辑和锁；先调用一次 getter 可确保模块已注册。
+    _get_r4_score_summary()
+    with _r4_import_lock:
+        if _r5_score_conclusion_fn is not None:
+            return _r5_score_conclusion_fn
+        module = sys.modules.get(_R4_MODULE_NAME)
+        if module is None:
+            raise RuntimeError("R4/R5 reward client module was not loaded")
+        score_fn = getattr(module, "score_conclusion", None)
+        if not callable(score_fn):
+            raise AttributeError("score_conclusion is missing from reward client")
+        _r5_score_conclusion_fn = score_fn
+        return _r5_score_conclusion_fn
 
 
 # ============================================================
@@ -324,6 +355,35 @@ def _parse_json_obj(raw):
     except (json.JSONDecodeError, ValueError):
         pass
     return _extract_last_json_obj(s)
+
+
+def _extract_thinking(solution_str):
+    """提取最后一个 ``</think>`` 前的 thinking；兼容 opening tag 在 prompt。"""
+    if not isinstance(solution_str, str):
+        return ""
+    end = solution_str.rfind("</think>")
+    if end < 0:
+        return ""
+    prefix = solution_str[:end]
+    start = prefix.rfind("<think>")
+    if start >= 0:
+        prefix = prefix[start + len("<think>"):]
+    return prefix.strip()
+
+
+def _extract_last_sentence(thinking):
+    """只取 CoT 最后一句；英文句点要求后接空白，中文标点可直接切分。"""
+    if not isinstance(thinking, str):
+        return ""
+    normalized = " ".join(thinking.split()).strip()
+    if not normalized:
+        return ""
+    sentences = [
+        part.strip()
+        for part in re.split(r"(?<=[!?。！？])\s*|(?<=\.)\s+", normalized)
+        if part.strip()
+    ]
+    return sentences[-1] if sentences else normalized
 
 
 # ============================================================
@@ -981,6 +1041,27 @@ KNOWN_SOURCES = (JSON_ANSWER_SOURCES | HUNGARIAN_IOU_SOURCES
                  | SPATIAL_CONSISTENCY_BBOX_SOURCES | SPATIAL_DETECTION_SOURCES
                  | ANSWER_SUMMARY_EVAL_SOURCES)
 
+# R5 只用于有二元空间一致性结论的 CoT 路由。数据源极性与 GT answer
+# 一起定义了选项语义，因此无需把完整 prompt 或 A/B 选项送入在线判官。
+R5_CONSISTENT_SOURCES = {
+    "spatial_consistency_pos",
+    "spatial_consistency_pos_train",
+    "spatial_consistency_bbox_pos",
+    "spatial_consistency_bbox_pos_train",
+    "consistent_qwen_eval",
+    "consistent_qwen",
+}
+R5_INCONSISTENT_SOURCES = {
+    "spatial_consistency_neg",
+    "spatial_consistency_neg_train",
+    "spatial_consistency_bbox_neg",
+    "spatial_consistency_bbox_neg_train",
+    "inconsistent_qwen_eval",
+    "inconsistent_qwen",
+    INCONSISTENT_COT_LOCAL_EVAL_SOURCE,
+}
+R5_SOURCES = R5_CONSISTENT_SOURCES | R5_INCONSISTENT_SOURCES
+
 
 def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     """verl 标准 reward function 入口。按 data_source 路由到对应奖励类别。
@@ -1017,6 +1098,96 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
         f"已知值: {sorted(KNOWN_SOURCES)}。"
         f"请检查 parquet 的 data_source 列与 reward 路由键名是否一致。"
     )
+
+
+def _answer_correctness_for_r5(data_source, solution_str, ground_truth):
+    """返回供 DAPO ``filter_groups.metric=acc`` 使用的原始二值正确率。"""
+    if data_source in JSON_ANSWER_SOURCES:
+        return score_json_answer(solution_str, ground_truth)
+    if data_source in SPATIAL_CONSISTENCY_BBOX_SOURCES:
+        gt_obj = _parse_json_obj(ground_truth)
+        pred_obj = _parse_json_obj(solution_str)
+        gt_answer = _normalize_answer(
+            gt_obj.get("answer") if isinstance(gt_obj, dict) else None
+        )
+        pred_answer = _normalize_answer(
+            pred_obj.get("answer") if isinstance(pred_obj, dict) else None
+        )
+        return float(
+            gt_answer is not None
+            and pred_answer is not None
+            and gt_answer == pred_answer
+        )
+    return None
+
+
+def compute_score_r5(data_source, solution_str, ground_truth, extra_info=None):
+    """训练入口：在旧奖励上应用 R5 最后一句一致性门控。
+
+    - 只有 R5 空间一致性路由且 answer 正确时才调用 9B，减少无效请求。
+    - 明确冲突按概率把正奖励压到最低 0.5；U 不处罚。
+    - 缺少合法 thinking/最后一句时 gate=0。
+    - ``acc`` 始终保留原 answer 0/1，避免 DAPO group filtering 被连续
+      R5 分数污染。非分类路由保持原先用总奖励作为 acc 的行为。
+    """
+    base_reward = float(
+        compute_score(data_source, solution_str, ground_truth, extra_info)
+    )
+    answer_correctness = _answer_correctness_for_r5(
+        data_source, solution_str, ground_truth
+    )
+    acc = base_reward if answer_correctness is None else answer_correctness
+
+    gate = 1.0
+    applied = 0.0
+    malformed = 0.0
+    conflict_probability = 0.0
+    unclear_probability = 0.0
+
+    # answer 错误时旧奖励已经是 0，不再浪费一次 R5 模型调用。
+    if data_source in R5_SOURCES and answer_correctness == 1.0:
+        applied = 1.0
+        thinking = _extract_thinking(solution_str)
+        last_sentence = _extract_last_sentence(thinking)
+        if not thinking or not last_sentence:
+            gate = 0.0
+            malformed = 1.0
+        else:
+            expected_stance = (
+                "consistent"
+                if data_source in R5_CONSISTENT_SOURCES
+                else "inconsistent"
+            )
+            result = _get_r5_score_conclusion()(
+                last_sentence, expected_stance
+            )
+            if not isinstance(result, dict):
+                raise TypeError(
+                    f"R5 client returned {type(result).__name__}, expected dict"
+                )
+            gate = float(result["score"])
+            conflict_probability = float(result["conflict_probability"])
+            unclear_probability = float(result["unclear_probability"])
+            for name, value in (
+                ("gate", gate),
+                ("conflict_probability", conflict_probability),
+                ("unclear_probability", unclear_probability),
+            ):
+                if not np.isfinite(value) or not 0.0 <= value <= 1.0:
+                    raise ValueError(f"R5 returned invalid {name}: {value!r}")
+
+    # 乘法门控只削减正奖励；负奖励保持不变，防止通过制造冲突减轻惩罚。
+    score = base_reward * gate if base_reward > 0.0 else base_reward
+    return {
+        "score": score,
+        "acc": float(acc),
+        "base_reward": base_reward,
+        "R5": gate,
+        "r5_applied": applied,
+        "reasoning_conflict_probability": conflict_probability,
+        "reasoning_unclear_probability": unclear_probability,
+        "reasoning_malformed": malformed,
+    }
 
 
 # ============================================================

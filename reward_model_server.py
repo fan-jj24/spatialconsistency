@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""R4 中央动态批处理 HTTP 服务。
+"""R4/R5 共享模型的中央动态批处理 HTTP 服务。
 
 多个 verl reward worker 仍逐条请求 ``POST /score``。服务把同时到达的
-请求在很短的时间窗内合并，然后调用一次 ``reward_model.score_summaries``。
+请求在很短的时间窗内合并。R4 长请求和 R5 短请求使用独立队列及 batch，
+但调用同一个常驻 Qwen3.5-9B 模型，避免重复加载权重和异长 padding。
+两个队列使用相同的 batch 上限和等待窗口；模型空闲时优先处理当前已
+攒好请求数更多的 batch，请求数相同时处理更早等待的 batch。
 
 模型加载或任一批推理失败属于致命错误：失败会传给该批及队列中的所有
 请求，服务随后以非零状态退出。服务不会重试，也不会返回降级分数。
@@ -19,10 +22,30 @@ from queue import Empty, Queue
 import signal
 import threading
 import time
-from typing import Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 LOGGER = logging.getLogger("r4_reward_server")
 MAX_REQUEST_BYTES = 1024 * 1024
+
+
+def _validate_unit_score(value: Any) -> float:
+    score = float(value)
+    if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+        raise ValueError(f"reward model returned an invalid score: {score!r}")
+    return score
+
+
+def _validate_r5_result(value: Any) -> dict:
+    result = {
+        "score": _validate_unit_score(getattr(value, "gate", None)),
+        "conflict_probability": _validate_unit_score(
+            getattr(value, "conflict_probability", None)
+        ),
+        "unclear_probability": _validate_unit_score(
+            getattr(value, "unclear_probability", None)
+        ),
+    }
+    return result
 
 
 @dataclass
@@ -36,7 +59,9 @@ class DynamicBatcher:
 
     def __init__(
         self,
-        score_batch: Callable[[List[Tuple[str, str]]], List[float]],
+        score_batch: Callable[[List[Tuple[str, str]]], List[Any]],
+        validate_result: Callable[[Any], Any],
+        task_name: str,
         max_batch_size: int,
         max_wait_ms: float,
         on_fatal: Callable[[BaseException], None],
@@ -46,6 +71,8 @@ class DynamicBatcher:
         if not math.isfinite(max_wait_ms) or max_wait_ms < 0:
             raise ValueError("max_wait_ms must be finite and non-negative")
         self._score_batch = score_batch
+        self._validate_result = validate_result
+        self._task_name = task_name
         self._max_batch_size = max_batch_size
         self._max_wait_seconds = max_wait_ms / 1000.0
         self._on_fatal = on_fatal
@@ -54,21 +81,25 @@ class DynamicBatcher:
         self._fatal_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = threading.Thread(
-            target=self._run, name="r4-dynamic-batcher", daemon=True
+            target=self._run,
+            name=f"{task_name.lower()}-dynamic-batcher",
+            daemon=True,
         )
 
     def start(self):
         self._thread.start()
 
-    def submit(self, pred_summary: str, gt_summary: str) -> float:
+    def submit(self, first_value: str, second_value: str) -> Any:
         fatal_error = self.fatal_error
         if fatal_error is not None:
-            raise RuntimeError("R4 batcher is in a fatal state") from fatal_error
+            raise RuntimeError(
+                f"{self._task_name} batcher is in a fatal state"
+            ) from fatal_error
         if self._stop.is_set():
-            raise RuntimeError("R4 batcher is stopped")
+            raise RuntimeError(f"{self._task_name} batcher is stopped")
 
         future = Future()
-        self._queue.put(PendingRequest((pred_summary, gt_summary), future))
+        self._queue.put(PendingRequest((first_value, second_value), future))
         return future.result()
 
     @property
@@ -76,10 +107,29 @@ class DynamicBatcher:
         with self._fatal_lock:
             return self._fatal_error
 
+    @property
+    def queued_count(self) -> int:
+        """返回尚未并入当前 batch 的排队请求数。"""
+        return self._queue.qsize()
+
     def close(self):
         self._stop.set()
         if self._thread.is_alive():
             self._thread.join(timeout=5)
+
+    def abort(self, exc: BaseException):
+        """使队列进入 fatal 状态，并唤醒尚未开始推理的请求。"""
+        with self._fatal_lock:
+            if self._fatal_error is None:
+                self._fatal_error = exc
+        self._stop.set()
+        while True:
+            try:
+                request = self._queue.get_nowait()
+            except Empty:
+                break
+            if not request.future.done():
+                request.future.set_exception(exc)
 
     def _run(self):
         while not self._stop.is_set():
@@ -100,7 +150,9 @@ class DynamicBatcher:
                     break
 
             try:
+                inference_started = time.monotonic()
                 scores = self._score_batch([request.pair for request in batch])
+                inference_ms = (time.monotonic() - inference_started) * 1000.0
                 if not isinstance(scores, (list, tuple)):
                     raise TypeError(
                         "score_summaries must return a list or tuple, "
@@ -111,44 +163,105 @@ class DynamicBatcher:
                         "score_summaries returned the wrong number of scores: "
                         f"expected {len(batch)}, got {len(scores)}"
                     )
-                checked_scores = []
-                for score in scores:
-                    score = float(score)
-                    if not math.isfinite(score) or not 0.0 <= score <= 1.0:
-                        raise ValueError(
-                            f"score_summaries returned an invalid score: {score!r}"
-                        )
-                    checked_scores.append(score)
+                checked_scores = [self._validate_result(score) for score in scores]
             except BaseException as exc:
                 self._fail_fatally(exc, batch)
                 return
 
-            LOGGER.info("Scored R4 batch of %d request(s)", len(batch))
+            LOGGER.info(
+                "Scored %s batch of %d request(s) in %.1f ms",
+                self._task_name,
+                len(batch),
+                inference_ms,
+            )
             for request, score in zip(batch, checked_scores):
                 request.future.set_result(score)
 
     def _fail_fatally(self, exc: BaseException, active_batch: List[PendingRequest]):
-        with self._fatal_lock:
-            if self._fatal_error is None:
-                self._fatal_error = exc
-        self._stop.set()
-        LOGGER.exception("Fatal R4 batch inference error", exc_info=exc)
+        self.abort(exc)
+        LOGGER.exception(
+            "Fatal %s batch inference error", self._task_name, exc_info=exc
+        )
 
         pending = list(active_batch)
-        while True:
-            try:
-                pending.append(self._queue.get_nowait())
-            except Empty:
-                break
         for request in pending:
             if not request.future.done():
                 request.future.set_exception(exc)
         self._on_fatal(exc)
 
 
+class QueueLengthInferenceScheduler:
+    """串行化共享模型调用，优先执行请求数更多的已就绪 batch。"""
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._active = False
+        # 值为 (batch 请求数, 到达序号, 后续队列长度读取函数)。每类只有
+        # 一个 batcher 线程，因而同一任务同时最多有一个已攒好的 batch。
+        self._waiting: dict[
+            str, Optional[Tuple[int, int, Callable[[], int]]]
+        ] = {
+            "R4": None,
+            "R5": None,
+        }
+        self._arrival_sequence = 0
+
+    def _may_start(self, task_name: str) -> bool:
+        if self._active:
+            return False
+        candidates = [
+            (name, waiting)
+            for name, waiting in self._waiting.items()
+            if waiting is not None
+        ]
+        if not candidates:
+            return False
+        # 当前总等待数 = 已攒好的 batch + 其后继续到达的排队请求。
+        # 总等待数相同时，arrival_sequence 越小（等待越久）越优先。
+        selected, _ = max(
+            candidates,
+            key=lambda item: (
+                item[1][0] + item[1][2](),
+                -item[1][1],
+            ),
+        )
+        return selected == task_name
+
+    def run(
+        self,
+        task_name: str,
+        function: Callable,
+        values: list,
+        queued_count: Optional[Callable[[], int]] = None,
+    ):
+        if task_name not in self._waiting:
+            raise ValueError(f"unknown inference task: {task_name!r}")
+        with self._condition:
+            if self._waiting[task_name] is not None:
+                raise RuntimeError(f"{task_name} already has a waiting batch")
+            self._arrival_sequence += 1
+            self._waiting[task_name] = (
+                len(values),
+                self._arrival_sequence,
+                queued_count or (lambda: 0),
+            )
+            try:
+                self._condition.wait_for(lambda: self._may_start(task_name))
+                self._active = True
+            finally:
+                self._waiting[task_name] = None
+        try:
+            return function(values)
+        finally:
+            with self._condition:
+                self._active = False
+                self._condition.notify_all()
+
+
 class ServerState:
     def __init__(self):
-        self.batcher: Optional[DynamicBatcher] = None
+        self.r4_batcher: Optional[DynamicBatcher] = None
+        self.r5_batcher: Optional[DynamicBatcher] = None
         self.backend: Optional[str] = None
         self.ready = False
         self.fatal_error: Optional[BaseException] = None
@@ -184,32 +297,57 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(503, {"status": "loading"})
 
     def do_POST(self):
-        if self.path != "/score":
+        if self.path not in {"/score", "/score/r5"}:
             self._send_json(404, {"error": "not found"})
             return
         try:
             payload = self._read_payload()
-            pred_summary = payload.get("pred_summary")
-            gt_summary = payload.get("gt_summary")
-            if not isinstance(pred_summary, str) or not isinstance(gt_summary, str):
-                raise ValueError("pred_summary and gt_summary must both be strings")
-
             with self.server.state.lock:
-                batcher = self.server.state.batcher
                 ready = self.server.state.ready
                 fatal_error = self.server.state.fatal_error
             if fatal_error is not None:
-                raise RuntimeError("R4 reward service is in a fatal state") from fatal_error
-            if not ready or batcher is None:
-                self._send_json(503, {"error": "R4 reward model is still loading"})
+                raise RuntimeError(
+                    "R4/R5 reward service is in a fatal state"
+                ) from fatal_error
+            if not ready:
+                self._send_json(
+                    503, {"error": "R4/R5 reward model is still loading"}
+                )
                 return
 
-            score = batcher.submit(pred_summary, gt_summary)
-            self._send_json(200, {"score": score})
+            if self.path == "/score":
+                pred_summary = payload.get("pred_summary")
+                gt_summary = payload.get("gt_summary")
+                if not isinstance(pred_summary, str) or not isinstance(
+                    gt_summary, str
+                ):
+                    raise ValueError(
+                        "pred_summary and gt_summary must both be strings"
+                    )
+                batcher = self.server.state.r4_batcher
+                if batcher is None:
+                    raise RuntimeError("R4 batcher is unavailable")
+                score = batcher.submit(pred_summary, gt_summary)
+                self._send_json(200, {"score": score})
+                return
+
+            sentence = payload.get("sentence")
+            expected_stance = payload.get("expected_stance")
+            if not isinstance(sentence, str) or not isinstance(
+                expected_stance, str
+            ):
+                raise ValueError(
+                    "sentence and expected_stance must both be strings"
+                )
+            batcher = self.server.state.r5_batcher
+            if batcher is None:
+                raise RuntimeError("R5 batcher is unavailable")
+            result = batcher.submit(sentence, expected_stance)
+            self._send_json(200, result)
         except (ValueError, json.JSONDecodeError) as exc:
             self._send_json(400, {"error": str(exc)})
         except BaseException as exc:
-            LOGGER.exception("R4 score request failed", exc_info=exc)
+            LOGGER.exception("R4/R5 score request failed", exc_info=exc)
             self._send_json(500, {"error": str(exc)})
 
     def _read_payload(self) -> dict:
@@ -262,8 +400,8 @@ def parse_args():
         default="auto",
         help="Transformers 设备，如 auto、cuda、cuda:0 或 cpu",
     )
-    # 每对 summary 对应一个四分类 prompt；默认一次送入后端 100 条。
-    parser.add_argument("--max-batch-size", type=int, default=100)
+    # R4/R5 分队列攒批，但共用相同的批量和等待设置。
+    parser.add_argument("--max-batch-size", type=int, default=32)
     parser.add_argument("--max-wait-ms", type=float, default=20.0)
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
@@ -289,6 +427,10 @@ def run_server(args) -> int:
         with state.lock:
             state.fatal_error = exc
             state.ready = False
+            batchers = (state.r4_batcher, state.r5_batcher)
+        for shared_batcher in batchers:
+            if shared_batcher is not None:
+                shared_batcher.abort(exc)
 
         # 给正在返回 500 的 handler 一个很短的发送窗口，然后非零退出。
         def delayed_shutdown():
@@ -306,11 +448,12 @@ def run_server(args) -> int:
     if hasattr(signal, "SIGBREAK"):
         signal.signal(signal.SIGBREAK, handle_signal)
 
-    batcher = None
+    r4_batcher = None
+    r5_batcher = None
     model = None
     backend = None
     try:
-        LOGGER.info("Loading R4 reward model before accepting score requests")
+        LOGGER.info("Loading shared R4/R5 reward model before accepting requests")
         # 延迟导入，确保模块导入和 DynamicBatcher 单元测试不要求任何
         # 模型依赖。auto 在 Windows 或 vLLM 无法导入时使用 Transformers。
         import reward_model as reward_model_module
@@ -322,22 +465,46 @@ def run_server(args) -> int:
             backend=getattr(args, "backend", "auto"),
             device=getattr(args, "transformers_device", "auto"),
         )
-        LOGGER.info("Selected R4 backend: %s", backend)
+        LOGGER.info("Selected R4/R5 backend: %s", backend)
         model.load()
-        batcher = DynamicBatcher(
-            model.score_summaries,
+        inference_scheduler = QueueLengthInferenceScheduler()
+        r4_batcher = DynamicBatcher(
+            lambda pairs: inference_scheduler.run(
+                "R4",
+                model.score_summaries,
+                pairs,
+                lambda: r4_batcher.queued_count,
+            ),
+            validate_result=_validate_unit_score,
+            task_name="R4",
             max_batch_size=args.max_batch_size,
             max_wait_ms=args.max_wait_ms,
             on_fatal=fatal_shutdown,
         )
-        batcher.start()
+        r5_batcher = DynamicBatcher(
+            lambda pairs: inference_scheduler.run(
+                "R5",
+                model.score_conclusions,
+                pairs,
+                lambda: r5_batcher.queued_count,
+            ),
+            validate_result=_validate_r5_result,
+            task_name="R5",
+            max_batch_size=args.max_batch_size,
+            max_wait_ms=args.max_wait_ms,
+            on_fatal=fatal_shutdown,
+        )
+        r4_batcher.start()
+        r5_batcher.start()
         with state.lock:
-            state.batcher = batcher
+            state.r4_batcher = r4_batcher
+            state.r5_batcher = r5_batcher
             state.backend = backend
             state.ready = True
         LOGGER.info(
-            "R4 reward service ready at http://%s:%d "
-            "(backend=%s, max_batch_size=%d, max_wait_ms=%s)",
+            "R4/R5 reward service ready at http://%s:%d "
+            "(backend=%s, R4/R5 separate queues, batch=%d/%sms, "
+            "larger ready queue first)",
             args.host,
             args.port,
             backend,
@@ -349,13 +516,15 @@ def run_server(args) -> int:
         with state.lock:
             state.fatal_error = exc
             state.ready = False
-        LOGGER.exception("R4 reward service failed", exc_info=exc)
+        LOGGER.exception("R4/R5 reward service failed", exc_info=exc)
         shutdown()
     finally:
-        if batcher is not None:
-            batcher.close()
+        if r4_batcher is not None:
+            r4_batcher.close()
+        if r5_batcher is not None:
+            r5_batcher.close()
         if model is not None:
-            LOGGER.info("Shutting down R4 %s backend", backend or "model")
+            LOGGER.info("Shutting down R4/R5 %s backend", backend or "model")
             model.close()
         server.server_close()
         server_thread.join(timeout=5)
@@ -371,6 +540,10 @@ def main() -> int:
     )
     if not 1 <= args.port <= 65535:
         raise ValueError(f"port must be in [1, 65535], got {args.port}")
+    if args.max_batch_size <= 0:
+        raise ValueError("max-batch-size must be positive")
+    if not math.isfinite(args.max_wait_ms) or args.max_wait_ms < 0:
+        raise ValueError("max-wait-ms must be finite and non-negative")
     return run_server(args)
 
 
