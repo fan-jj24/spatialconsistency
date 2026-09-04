@@ -172,7 +172,7 @@ class TransformersRewardModel:
             sentence,
             add_special_tokens=False,
             truncation=True,
-            max_length=self._config.R5_MAX_SENTENCE_TOKENS,
+            max_length=self._config.REASONING_GATE_MAX_SENTENCE_TOKENS,
         )
         return self._tokenizer.decode(token_ids, skip_special_tokens=True)
 
@@ -194,13 +194,18 @@ class TransformersRewardModel:
             enable_thinking=False,
         )
 
-    def _build_r5_prompt(self, sentence):
+    def _build_reasoning_gate_prompt(self, sentence, option_a, option_b):
         messages = [
-            {"role": "system", "content": self._config.R5_SYSTEM_PROMPT},
+            {
+                "role": "system",
+                "content": self._config.REASONING_GATE_SYSTEM_PROMPT,
+            },
             {
                 "role": "user",
-                "content": self._config.R5_INPUT_TEMPLATE.format(
-                    sentence=sentence
+                "content": self._config.REASONING_GATE_INPUT_TEMPLATE.format(
+                    sentence=sentence,
+                    option_a=option_a,
+                    option_b=option_b,
                 ),
             },
         ]
@@ -324,58 +329,55 @@ class TransformersRewardModel:
             results[index] = float(score)
         return results
 
-    def score_conclusion(self, sentence, expected_stance):
-        return self.score_conclusions([(sentence, expected_stance)])[0]
+    def classify_option_support(self, sentence, option_a, option_b):
+        return self.classify_option_support_batch(
+            [(sentence, option_a, option_b)]
+        )[0]
 
-    def score_conclusions(self, pairs):
-        if not pairs:
+    def classify_option_support_batch(self, items):
+        if not items:
             return []
-        normalized_pairs = []
-        for index, pair in enumerate(pairs):
-            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+        normalized_items = []
+        for index, item in enumerate(items):
+            if not isinstance(item, (list, tuple)) or len(item) != 3:
                 raise TypeError(
-                    f"pairs[{index}] 必须是 (sentence, expected_stance)"
+                    f"items[{index}] 必须是 (sentence, option_a, option_b)"
                 )
-            sentence, expected_stance = pair
-            if not isinstance(sentence, str) or not isinstance(expected_stance, str):
-                raise TypeError(f"pairs[{index}] 的 R5 输入必须都是字符串")
-            expected_stance = expected_stance.strip().lower()
-            if expected_stance not in {"consistent", "inconsistent"}:
-                raise ValueError(
-                    f"pairs[{index}] 的 expected_stance 无效: "
-                    f"{expected_stance!r}"
-                )
+            sentence, option_a, option_b = item
+            if not all(isinstance(value, str) for value in item):
+                raise TypeError(f"items[{index}] 的 reasoning gate 输入必须都是字符串")
             if not sentence.strip():
-                raise ValueError(f"pairs[{index}] 的最后一句为空")
-            normalized_pairs.append((sentence, expected_stance))
+                raise ValueError(f"items[{index}] 的最后一句为空")
+            if not option_a.strip() or not option_b.strip():
+                raise ValueError(f"items[{index}] 的 A/B 选项为空")
+            normalized_items.append((sentence, option_a, option_b))
 
         self._ensure_loaded()
         prompts = [
-            self._build_r5_prompt(self._truncate_conclusion(sentence))
-            for sentence, _ in normalized_pairs
+            self._build_reasoning_gate_prompt(
+                self._truncate_conclusion(sentence), option_a, option_b
+            )
+            for sentence, option_a, option_b in normalized_items
         ]
         probabilities, choice_masses = self._infer_probabilities(
-            prompts, self._config.R5_CHOICE_LETTERS, "R5"
+            prompts,
+            self._config.REASONING_GATE_CHOICE_LETTERS,
+            "reasoning gate",
         )
         results = []
-        for (_, expected_stance), row, choice_mass in zip(
-            normalized_pairs, probabilities, choice_masses
-        ):
-            consistent_p, inconsistent_p, unclear_p = [float(x) for x in row]
-            conflict_probability = (
-                inconsistent_p
-                if expected_stance == "consistent"
-                else consistent_p
+        for row, choice_mass in zip(probabilities, choice_masses):
+            class_probabilities = tuple(float(x) for x in row)
+            supported_index = max(
+                range(len(class_probabilities)),
+                key=class_probabilities.__getitem__,
             )
-            gate = 1.0 - (
-                1.0 - self._config.R5_CONFLICT_GATE
-            ) * conflict_probability
             results.append(
-                self._config.ConclusionScore(
-                    gate=max(0.0, min(1.0, float(gate))),
-                    conflict_probability=float(conflict_probability),
-                    unclear_probability=unclear_p,
-                    probabilities=(consistent_p, inconsistent_p, unclear_p),
+                self._config.OptionSupportScore(
+                    supported_option=self._config.REASONING_GATE_CHOICE_LETTERS[
+                        supported_index
+                    ],
+                    unclear_probability=class_probabilities[2],
+                    probabilities=class_probabilities,
                     choice_mass=float(choice_mass),
                 )
             )

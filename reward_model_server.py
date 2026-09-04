@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""R4/R5 共享模型的中央动态批处理 HTTP 服务。
+"""R4 与 reasoning 门控共享模型的中央动态批处理 HTTP 服务。
 
 多个 verl reward worker 仍逐条请求 ``POST /score``。服务把同时到达的
-请求在很短的时间窗内合并。R4 长请求和 R5 短请求使用独立队列及 batch，
+请求在很短的时间窗内合并。R4 和 reasoning gate 使用独立队列及 batch，
 但调用同一个常驻 Qwen3.5-9B 模型，避免重复加载权重和异长 padding。
 两个队列使用相同的 batch 上限和等待窗口；模型空闲时优先处理当前已
 攒好请求数更多的 batch，请求数相同时处理更早等待的 batch。
@@ -35,12 +35,14 @@ def _validate_unit_score(value: Any) -> float:
     return score
 
 
-def _validate_r5_result(value: Any) -> dict:
+def _validate_reasoning_gate_result(value: Any) -> dict:
+    supported_option = str(getattr(value, "supported_option", "")).upper()
+    if supported_option not in {"A", "B", "U"}:
+        raise ValueError(
+            f"reward model returned an invalid supported option: {supported_option!r}"
+        )
     result = {
-        "score": _validate_unit_score(getattr(value, "gate", None)),
-        "conflict_probability": _validate_unit_score(
-            getattr(value, "conflict_probability", None)
-        ),
+        "supported_option": supported_option,
         "unclear_probability": _validate_unit_score(
             getattr(value, "unclear_probability", None)
         ),
@@ -50,7 +52,7 @@ def _validate_r5_result(value: Any) -> dict:
 
 @dataclass
 class PendingRequest:
-    pair: Tuple[str, str]
+    values: Tuple[str, ...]
     future: Future
 
 
@@ -59,7 +61,7 @@ class DynamicBatcher:
 
     def __init__(
         self,
-        score_batch: Callable[[List[Tuple[str, str]]], List[Any]],
+        score_batch: Callable[[List[Tuple[str, ...]]], List[Any]],
         validate_result: Callable[[Any], Any],
         task_name: str,
         max_batch_size: int,
@@ -89,7 +91,9 @@ class DynamicBatcher:
     def start(self):
         self._thread.start()
 
-    def submit(self, first_value: str, second_value: str) -> Any:
+    def submit(self, *values: str) -> Any:
+        if not values or not all(isinstance(value, str) for value in values):
+            raise TypeError("batcher values must be strings")
         fatal_error = self.fatal_error
         if fatal_error is not None:
             raise RuntimeError(
@@ -99,7 +103,7 @@ class DynamicBatcher:
             raise RuntimeError(f"{self._task_name} batcher is stopped")
 
         future = Future()
-        self._queue.put(PendingRequest((first_value, second_value), future))
+        self._queue.put(PendingRequest(tuple(values), future))
         return future.result()
 
     @property
@@ -151,7 +155,7 @@ class DynamicBatcher:
 
             try:
                 inference_started = time.monotonic()
-                scores = self._score_batch([request.pair for request in batch])
+                scores = self._score_batch([request.values for request in batch])
                 inference_ms = (time.monotonic() - inference_started) * 1000.0
                 if not isinstance(scores, (list, tuple)):
                     raise TypeError(
@@ -202,7 +206,7 @@ class QueueLengthInferenceScheduler:
             str, Optional[Tuple[int, int, Callable[[], int]]]
         ] = {
             "R4": None,
-            "R5": None,
+            "reasoning_gate": None,
         }
         self._arrival_sequence = 0
 
@@ -261,7 +265,7 @@ class QueueLengthInferenceScheduler:
 class ServerState:
     def __init__(self):
         self.r4_batcher: Optional[DynamicBatcher] = None
-        self.r5_batcher: Optional[DynamicBatcher] = None
+        self.reasoning_gate_batcher: Optional[DynamicBatcher] = None
         self.backend: Optional[str] = None
         self.ready = False
         self.fatal_error: Optional[BaseException] = None
@@ -297,7 +301,7 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(503, {"status": "loading"})
 
     def do_POST(self):
-        if self.path not in {"/score", "/score/r5"}:
+        if self.path not in {"/score", "/classify-option-support"}:
             self._send_json(404, {"error": "not found"})
             return
         try:
@@ -307,11 +311,11 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
                 fatal_error = self.server.state.fatal_error
             if fatal_error is not None:
                 raise RuntimeError(
-                    "R4/R5 reward service is in a fatal state"
+                    "shared reward service is in a fatal state"
                 ) from fatal_error
             if not ready:
                 self._send_json(
-                    503, {"error": "R4/R5 reward model is still loading"}
+                    503, {"error": "shared reward model is still loading"}
                 )
                 return
 
@@ -332,22 +336,23 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
                 return
 
             sentence = payload.get("sentence")
-            expected_stance = payload.get("expected_stance")
-            if not isinstance(sentence, str) or not isinstance(
-                expected_stance, str
+            option_a = payload.get("option_a")
+            option_b = payload.get("option_b")
+            if not all(
+                isinstance(value, str) for value in (sentence, option_a, option_b)
             ):
                 raise ValueError(
-                    "sentence and expected_stance must both be strings"
+                    "sentence, option_a and option_b must all be strings"
                 )
-            batcher = self.server.state.r5_batcher
+            batcher = self.server.state.reasoning_gate_batcher
             if batcher is None:
-                raise RuntimeError("R5 batcher is unavailable")
-            result = batcher.submit(sentence, expected_stance)
+                raise RuntimeError("reasoning gate batcher is unavailable")
+            result = batcher.submit(sentence, option_a, option_b)
             self._send_json(200, result)
         except (ValueError, json.JSONDecodeError) as exc:
             self._send_json(400, {"error": str(exc)})
         except BaseException as exc:
-            LOGGER.exception("R4/R5 score request failed", exc_info=exc)
+            LOGGER.exception("reward model request failed", exc_info=exc)
             self._send_json(500, {"error": str(exc)})
 
     def _read_payload(self) -> dict:
@@ -400,7 +405,7 @@ def parse_args():
         default="auto",
         help="Transformers 设备，如 auto、cuda、cuda:0 或 cpu",
     )
-    # R4/R5 分队列攒批，但共用相同的批量和等待设置。
+    # R4/reasoning gate 分队列攒批，但共用相同的批量和等待设置。
     parser.add_argument("--max-batch-size", type=int, default=32)
     parser.add_argument("--max-wait-ms", type=float, default=20.0)
     parser.add_argument("--log-level", default="INFO")
@@ -427,7 +432,7 @@ def run_server(args) -> int:
         with state.lock:
             state.fatal_error = exc
             state.ready = False
-            batchers = (state.r4_batcher, state.r5_batcher)
+            batchers = (state.r4_batcher, state.reasoning_gate_batcher)
         for shared_batcher in batchers:
             if shared_batcher is not None:
                 shared_batcher.abort(exc)
@@ -449,11 +454,11 @@ def run_server(args) -> int:
         signal.signal(signal.SIGBREAK, handle_signal)
 
     r4_batcher = None
-    r5_batcher = None
+    reasoning_gate_batcher = None
     model = None
     backend = None
     try:
-        LOGGER.info("Loading shared R4/R5 reward model before accepting requests")
+        LOGGER.info("Loading shared R4/reasoning-gate model before accepting requests")
         # 延迟导入，确保模块导入和 DynamicBatcher 单元测试不要求任何
         # 模型依赖。auto 在 Windows 或 vLLM 无法导入时使用 Transformers。
         import reward_model as reward_model_module
@@ -465,7 +470,7 @@ def run_server(args) -> int:
             backend=getattr(args, "backend", "auto"),
             device=getattr(args, "transformers_device", "auto"),
         )
-        LOGGER.info("Selected R4/R5 backend: %s", backend)
+        LOGGER.info("Selected shared reward backend: %s", backend)
         model.load()
         inference_scheduler = QueueLengthInferenceScheduler()
         r4_batcher = DynamicBatcher(
@@ -481,29 +486,29 @@ def run_server(args) -> int:
             max_wait_ms=args.max_wait_ms,
             on_fatal=fatal_shutdown,
         )
-        r5_batcher = DynamicBatcher(
-            lambda pairs: inference_scheduler.run(
-                "R5",
-                model.score_conclusions,
-                pairs,
-                lambda: r5_batcher.queued_count,
+        reasoning_gate_batcher = DynamicBatcher(
+            lambda items: inference_scheduler.run(
+                "reasoning_gate",
+                model.classify_option_support_batch,
+                items,
+                lambda: reasoning_gate_batcher.queued_count,
             ),
-            validate_result=_validate_r5_result,
-            task_name="R5",
+            validate_result=_validate_reasoning_gate_result,
+            task_name="reasoning_gate",
             max_batch_size=args.max_batch_size,
             max_wait_ms=args.max_wait_ms,
             on_fatal=fatal_shutdown,
         )
         r4_batcher.start()
-        r5_batcher.start()
+        reasoning_gate_batcher.start()
         with state.lock:
             state.r4_batcher = r4_batcher
-            state.r5_batcher = r5_batcher
+            state.reasoning_gate_batcher = reasoning_gate_batcher
             state.backend = backend
             state.ready = True
         LOGGER.info(
-            "R4/R5 reward service ready at http://%s:%d "
-            "(backend=%s, R4/R5 separate queues, batch=%d/%sms, "
+            "R4/reasoning-gate service ready at http://%s:%d "
+            "(backend=%s, separate queues, batch=%d/%sms, "
             "larger ready queue first)",
             args.host,
             args.port,
@@ -516,15 +521,15 @@ def run_server(args) -> int:
         with state.lock:
             state.fatal_error = exc
             state.ready = False
-        LOGGER.exception("R4/R5 reward service failed", exc_info=exc)
+        LOGGER.exception("shared reward service failed", exc_info=exc)
         shutdown()
     finally:
         if r4_batcher is not None:
             r4_batcher.close()
-        if r5_batcher is not None:
-            r5_batcher.close()
+        if reasoning_gate_batcher is not None:
+            reasoning_gate_batcher.close()
         if model is not None:
-            LOGGER.info("Shutting down R4/R5 %s backend", backend or "model")
+            LOGGER.info("Shutting down shared %s backend", backend or "model")
             model.close()
         server.server_close()
         server_thread.join(timeout=5)

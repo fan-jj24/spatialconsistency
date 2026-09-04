@@ -111,17 +111,19 @@ JSON RLVR Reward Function（分类奖励框架）
       第三类: R = C × (0.1 + 0.25×R2 + 0.25×R3 + 0.4×R4)
       第四类: R = 0.25×R2 + 0.25×R3 + 0.5×R4
 
-━━━ R5 训练门控（仅二元空间一致性 CoT）━━━
-  从 ``</think>`` 前只提取最后一句，Qwen3.5-9B 判断该句最终表达的是
-  consistent / inconsistent / U。R4 与 R5 共享同一模型实例，但使用独立
-  动态 batch 队列。R5 只在 answer 正确时调用：
-    gate = 1 - 0.5 × P(明确相反)
-    reward = max(base_reward, 0) × gate + min(base_reward, 0)
-  U 不处罚；thinking 缺失或无法提取最后一句时 gate=0。
-  DAPO 返回字段中的 acc 始终保留原始 answer 0/1。
+━━━ answer + reasoning 双门控（四个含 answer 的训练集）━━━
+  先计算 R1（最终 JSON answer 是否正确）。R1=0 时直接返回 0，不计算
+  reasoning 门控及后续 bbox/summary 奖励。
+
+  R1=1 时，从 ``</think>`` 前提取最后一句，并从 ``extra_info`` 的原题中
+  提取 A/B 选项。Qwen3.5-9B 只判断最后一句支持 A、B 还是 U，Python 再将
+  判官结果与模型最终 answer 比较：明确支持相反选项时 gate=0，否则为 1。
+  thinking 缺失时 gate=0；U 不处罚。gate=0 同样直接返回 0，不计算后续
+  bbox/summary 奖励。该门控不是独立奖励项，最终奖励就是原任务奖励乘以
+  ``R1 × reasoning_gate``。
 ━━━ 设计约束 ━━━
-  - 第一类保持严格 0/1 二值: DAPO 的 filter_groups.metric=acc 依赖
-    组内二值对错来过滤全对/全错 group。
+  - DAPO 使用 ``filter_groups.metric=score``。纯 answer 任务的 score 仍为
+    0/1；bbox 和 detection 则按连续总奖励的组内差异过滤。
   - 第二/三/四类为连续值: 组内几乎必然存在方差，filter_groups 的
     过滤基本不再触发——这是预期行为，连续奖励任务不依赖该机制。
   - 长度惩罚不在本函数内: 由 DAPO reward manager 的
@@ -137,7 +139,7 @@ verl 调用签名:
 
 在 verl 配置中注册:
     custom_reward_function.path = /path/to/json_answer_reward.py
-    custom_reward_function.name = compute_score_r5
+    custom_reward_function.name = compute_score_with_reasoning_gate
 """
 
 import importlib.util
@@ -154,7 +156,7 @@ from scipy.optimize import linear_sum_assignment
 # 用文件路径导入，避免 verl 从任意工作目录动态加载本文件时找不到同目录的
 # reward_model_client.py，也避免误导入环境中另一个同名模块。
 _r4_score_summary_fn = None
-_r5_score_conclusion_fn = None
+_reasoning_support_fn = None
 _r4_import_lock = threading.Lock()
 _R4_MODULE_NAME = "_spatialconsistency_r4_reward_model_client"
 
@@ -202,25 +204,27 @@ def _get_r4_score_summary():
         return _r4_score_summary_fn
 
 
-def _get_r5_score_conclusion():
-    """从共享客户端懒加载 R5；失败时禁止静默退回旧奖励。"""
-    global _r5_score_conclusion_fn
-    if _r5_score_conclusion_fn is not None:
-        return _r5_score_conclusion_fn
+def _get_reasoning_support():
+    """从共享客户端懒加载 reasoning 门控；失败时禁止静默降级。"""
+    global _reasoning_support_fn
+    if _reasoning_support_fn is not None:
+        return _reasoning_support_fn
 
     # 复用 R4 的模块加载逻辑和锁；先调用一次 getter 可确保模块已注册。
     _get_r4_score_summary()
     with _r4_import_lock:
-        if _r5_score_conclusion_fn is not None:
-            return _r5_score_conclusion_fn
+        if _reasoning_support_fn is not None:
+            return _reasoning_support_fn
         module = sys.modules.get(_R4_MODULE_NAME)
         if module is None:
-            raise RuntimeError("R4/R5 reward client module was not loaded")
-        score_fn = getattr(module, "score_conclusion", None)
+            raise RuntimeError("shared reward client module was not loaded")
+        score_fn = getattr(module, "classify_option_support", None)
         if not callable(score_fn):
-            raise AttributeError("score_conclusion is missing from reward client")
-        _r5_score_conclusion_fn = score_fn
-        return _r5_score_conclusion_fn
+            raise AttributeError(
+                "classify_option_support is missing from reward client"
+            )
+        _reasoning_support_fn = score_fn
+        return _reasoning_support_fn
 
 
 # ============================================================
@@ -384,6 +388,57 @@ def _extract_last_sentence(thinking):
         if part.strip()
     ]
     return sentences[-1] if sentences else normalized
+
+
+_OPTION_LINE_RE = re.compile(
+    r"^[ \t]*(?:OPTION[ \t]+)?([AB])[ \t]*[.．):：][ \t]*(.+?)[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _prompt_text(value):
+    """把 extra_info 中常见的字符串或 messages prompt 展平为文本。"""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        parts = [_prompt_text(item) for item in value]
+        return "\n".join(part for part in parts if part)
+    if isinstance(value, dict):
+        for key in ("content", "text"):
+            content = value.get(key)
+            if content is not None:
+                return _prompt_text(content)
+    return ""
+
+
+def _extract_ab_options(extra_info):
+    """从原题元数据提取 A/B 选项；缺失时抛错，禁止静默错误训练。"""
+    if not isinstance(extra_info, dict):
+        raise ValueError("reasoning 门控需要 dict 类型的 extra_info")
+
+    direct_a = extra_info.get("option_a")
+    direct_b = extra_info.get("option_b")
+    if isinstance(direct_a, str) and direct_a.strip() and isinstance(
+        direct_b, str
+    ) and direct_b.strip():
+        return direct_a.strip(), direct_b.strip()
+
+    prompt_text = ""
+    for key in ("question", "prompt", "input"):
+        prompt_text = _prompt_text(extra_info.get(key))
+        if prompt_text:
+            break
+    options = {
+        letter.upper(): text.strip()
+        for letter, text in _OPTION_LINE_RE.findall(prompt_text)
+        if text.strip()
+    }
+    if set(options) != {"A", "B"}:
+        raise ValueError(
+            "reasoning 门控无法从 extra_info 的 question/prompt/input 提取完整 "
+            "A/B 选项；也可直接提供 option_a 和 option_b"
+        )
+    return options["A"], options["B"]
 
 
 # ============================================================
@@ -1041,26 +1096,23 @@ KNOWN_SOURCES = (JSON_ANSWER_SOURCES | HUNGARIAN_IOU_SOURCES
                  | SPATIAL_CONSISTENCY_BBOX_SOURCES | SPATIAL_DETECTION_SOURCES
                  | ANSWER_SUMMARY_EVAL_SOURCES)
 
-# R5 只用于有二元空间一致性结论的 CoT 路由。数据源极性与 GT answer
-# 一起定义了选项语义，因此无需把完整 prompt 或 A/B 选项送入在线判官。
-R5_CONSISTENT_SOURCES = {
+# reasoning 门控用于当前五个训练集里除 detection 外的四个含 answer 路由。
+# 判官直接读取每道题自己的 A/B 选项，不再根据 data_source 猜选项语义。
+REASONING_GATE_SOURCES = {
     "spatial_consistency_pos",
     "spatial_consistency_pos_train",
-    "spatial_consistency_bbox_pos",
-    "spatial_consistency_bbox_pos_train",
-    "consistent_qwen_eval",
-    "consistent_qwen",
-}
-R5_INCONSISTENT_SOURCES = {
     "spatial_consistency_neg",
     "spatial_consistency_neg_train",
+    "spatial_consistency_bbox_pos",
+    "spatial_consistency_bbox_pos_train",
     "spatial_consistency_bbox_neg",
     "spatial_consistency_bbox_neg_train",
+    "consistent_qwen_eval",
+    "consistent_qwen",
     "inconsistent_qwen_eval",
     "inconsistent_qwen",
     INCONSISTENT_COT_LOCAL_EVAL_SOURCE,
 }
-R5_SOURCES = R5_CONSISTENT_SOURCES | R5_INCONSISTENT_SOURCES
 
 
 def compute_score(data_source, solution_str, ground_truth, extra_info=None):
@@ -1100,8 +1152,8 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     )
 
 
-def _answer_correctness_for_r5(data_source, solution_str, ground_truth):
-    """返回供 DAPO ``filter_groups.metric=acc`` 使用的原始二值正确率。"""
+def _answer_correctness(data_source, solution_str, ground_truth):
+    """返回含 answer 路由的 R1 二值门控，其他路由返回 None。"""
     if data_source in JSON_ANSWER_SOURCES:
         return score_json_answer(solution_str, ground_truth)
     if data_source in SPATIAL_CONSISTENCY_BBOX_SOURCES:
@@ -1121,72 +1173,94 @@ def _answer_correctness_for_r5(data_source, solution_str, ground_truth):
     return None
 
 
-def compute_score_r5(data_source, solution_str, ground_truth, extra_info=None):
-    """训练入口：在旧奖励上应用 R5 最后一句一致性门控。
+def compute_score_with_reasoning_gate(
+    data_source, solution_str, ground_truth, extra_info=None
+):
+    """训练入口：R1 正确后再应用最后一句—A/B 选项二值门控。
 
-    - 只有 R5 空间一致性路由且 answer 正确时才调用 9B，减少无效请求。
-    - 明确冲突按概率把正奖励压到最低 0.5；U 不处罚。
-    - 缺少合法 thinking/最后一句时 gate=0。
-    - ``acc`` 始终保留原 answer 0/1，避免 DAPO group filtering 被连续
-      R5 分数污染。非分类路由保持原先用总奖励作为 acc 的行为。
+    任一门控为 0 都立即返回，避免继续计算 bbox、R3 和 R4。detection
+    没有 answer，不应用这两个门控。返回 ``score`` 供 DAPO group filtering
+    和训练共同使用，不再返回或依赖 ``acc``。
     """
-    base_reward = float(
+    if data_source not in REASONING_GATE_SOURCES:
+        return {
+            "score": float(
+                compute_score(data_source, solution_str, ground_truth, extra_info)
+            ),
+            "R1": 1.0,
+            "reasoning_gate": 1.0,
+            "reasoning_gate_applied": 0.0,
+            "reasoning_malformed": 0.0,
+            "reasoning_unclear_probability": 0.0,
+        }
+
+    r1 = float(_answer_correctness(data_source, solution_str, ground_truth))
+    if r1 == 0.0:
+        return {
+            "score": 0.0,
+            "R1": 0.0,
+            "reasoning_gate": 0.0,
+            "reasoning_gate_applied": 0.0,
+            "reasoning_malformed": 0.0,
+            "reasoning_unclear_probability": 0.0,
+        }
+
+    thinking = _extract_thinking(solution_str)
+    last_sentence = _extract_last_sentence(thinking)
+    if not thinking or not last_sentence:
+        return {
+            "score": 0.0,
+            "R1": 1.0,
+            "reasoning_gate": 0.0,
+            "reasoning_gate_applied": 1.0,
+            "reasoning_malformed": 1.0,
+            "reasoning_unclear_probability": 0.0,
+        }
+
+    option_a, option_b = _extract_ab_options(extra_info)
+    result = _get_reasoning_support()(last_sentence, option_a, option_b)
+    if not isinstance(result, dict):
+        raise TypeError(
+            "reasoning gate client returned "
+            f"{type(result).__name__}, expected dict"
+        )
+    supported_option = str(result["supported_option"]).strip().upper()
+    if supported_option not in {"A", "B", "U"}:
+        raise ValueError(
+            f"reasoning gate returned invalid option: {supported_option!r}"
+        )
+    unclear_probability = float(result["unclear_probability"])
+    if not np.isfinite(unclear_probability) or not 0.0 <= unclear_probability <= 1.0:
+        raise ValueError(
+            "reasoning gate returned invalid unclear_probability: "
+            f"{unclear_probability!r}"
+        )
+
+    pred_answer = _extract_json_answer(solution_str)
+    expected_option = str(pred_answer).upper()
+    gate = float(
+        supported_option == "U" or supported_option == expected_option
+    )
+    if gate == 0.0:
+        return {
+            "score": 0.0,
+            "R1": 1.0,
+            "reasoning_gate": 0.0,
+            "reasoning_gate_applied": 1.0,
+            "reasoning_malformed": 0.0,
+            "reasoning_unclear_probability": unclear_probability,
+        }
+
+    score = float(
         compute_score(data_source, solution_str, ground_truth, extra_info)
     )
-    answer_correctness = _answer_correctness_for_r5(
-        data_source, solution_str, ground_truth
-    )
-    acc = base_reward if answer_correctness is None else answer_correctness
-
-    gate = 1.0
-    applied = 0.0
-    malformed = 0.0
-    conflict_probability = 0.0
-    unclear_probability = 0.0
-
-    # answer 错误时旧奖励已经是 0，不再浪费一次 R5 模型调用。
-    if data_source in R5_SOURCES and answer_correctness == 1.0:
-        applied = 1.0
-        thinking = _extract_thinking(solution_str)
-        last_sentence = _extract_last_sentence(thinking)
-        if not thinking or not last_sentence:
-            gate = 0.0
-            malformed = 1.0
-        else:
-            expected_stance = (
-                "consistent"
-                if data_source in R5_CONSISTENT_SOURCES
-                else "inconsistent"
-            )
-            result = _get_r5_score_conclusion()(
-                last_sentence, expected_stance
-            )
-            if not isinstance(result, dict):
-                raise TypeError(
-                    f"R5 client returned {type(result).__name__}, expected dict"
-                )
-            gate = float(result["score"])
-            conflict_probability = float(result["conflict_probability"])
-            unclear_probability = float(result["unclear_probability"])
-            for name, value in (
-                ("gate", gate),
-                ("conflict_probability", conflict_probability),
-                ("unclear_probability", unclear_probability),
-            ):
-                if not np.isfinite(value) or not 0.0 <= value <= 1.0:
-                    raise ValueError(f"R5 returned invalid {name}: {value!r}")
-
-    # 乘法门控只削减正奖励；负奖励保持不变，防止通过制造冲突减轻惩罚。
-    score = base_reward * gate if base_reward > 0.0 else base_reward
     return {
         "score": score,
-        "acc": float(acc),
-        "base_reward": base_reward,
-        "R5": gate,
-        "r5_applied": applied,
-        "reasoning_conflict_probability": conflict_probability,
+        "R1": 1.0,
+        "reasoning_gate": 1.0,
+        "reasoning_gate_applied": 1.0,
+        "reasoning_malformed": 0.0,
         "reasoning_unclear_probability": unclear_probability,
-        "reasoning_malformed": malformed,
     }
 
 

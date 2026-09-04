@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""R4/R5 共享动态批处理服务的同步客户端。
+"""R4 与 reasoning 门控共享动态批处理服务的同步客户端。
 
 verl 的 ``compute_score`` 是同步函数，因此客户端也保持同步。任何连接、
 超时、HTTP、JSON 或协议错误都会抛出异常，不重试、不返回降级分数。
@@ -97,24 +97,33 @@ def score_summary(pred_summary: str, gt_summary: str) -> float:
     return score
 
 
-def score_conclusion(sentence: str, expected_stance: str) -> dict:
-    """请求 R5 最后一句门控，返回 gate/冲突概率/U 概率。"""
+def classify_option_support(
+    sentence: str, option_a: str, option_b: str
+) -> dict:
+    """请求判官判断最后一句支持题目的 A、B 还是 U。"""
     result = _post_score(
-        "/score/r5",
-        {"sentence": sentence, "expected_stance": expected_stance},
-        "R5",
+        "/classify-option-support",
+        {"sentence": sentence, "option_a": option_a, "option_b": option_b},
+        "reasoning gate",
     )
-    required = ("score", "conflict_probability", "unclear_probability")
+    required = ("supported_option", "unclear_probability")
     if any(key not in result for key in required):
         raise RuntimeError(
-            f"R5 reward service returned an invalid response: {result!r}"
+            f"reasoning gate service returned an invalid response: {result!r}"
         )
-    checked = {}
-    for key in required:
-        value = float(result[key])
-        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
-            raise ValueError(
-                f"R5 reward service returned invalid {key}: {value!r}"
-            )
-        checked[key] = value
-    return checked
+    supported_option = str(result["supported_option"]).strip().upper()
+    if supported_option not in {"A", "B", "U"}:
+        raise ValueError(
+            "reasoning gate service returned invalid supported_option: "
+            f"{supported_option!r}"
+        )
+    unclear_probability = float(result["unclear_probability"])
+    if not math.isfinite(unclear_probability) or not 0.0 <= unclear_probability <= 1.0:
+        raise ValueError(
+            "reasoning gate service returned invalid unclear_probability: "
+            f"{unclear_probability!r}"
+        )
+    return {
+        "supported_option": supported_option,
+        "unclear_probability": unclear_probability,
+    }
