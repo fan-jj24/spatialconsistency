@@ -168,6 +168,25 @@ B. The arrangement remained stable.
 
 
 class RewardModelReasoningGateTests(unittest.TestCase):
+    def test_overlong_conclusion_keeps_tail_tokens(self):
+        model = reward_model.RewardModel()
+        model._tokenizer = mock.Mock()
+        model._tokenizer.encode.return_value = list(range(10))
+        model._tokenizer.decode.return_value = "tail"
+
+        with mock.patch.object(
+            reward_model, "REASONING_GATE_MAX_SENTENCE_TOKENS", 4
+        ):
+            result = model._truncate_conclusion("long conclusion")
+
+        self.assertEqual(result, "tail")
+        model._tokenizer.encode.assert_called_once_with(
+            "long conclusion", add_special_tokens=False
+        )
+        model._tokenizer.decode.assert_called_once_with(
+            [6, 7, 8, 9], skip_special_tokens=True
+        )
+
     def test_argmax_returns_supported_question_option(self):
         model = reward_model.RewardModel()
         with (

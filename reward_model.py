@@ -560,13 +560,12 @@ class RewardModel:
         return self._tokenizer.decode(token_ids, skip_special_tokens=True)
 
     def _truncate_conclusion(self, sentence: str) -> str:
-        """对异常超长的最后一句设置独立上限。"""
+        """限制最后一句长度；超限时保留更接近最终结论的句尾。"""
         token_ids = self._tokenizer.encode(
             sentence,
             add_special_tokens=False,
-            truncation=True,
-            max_length=REASONING_GATE_MAX_SENTENCE_TOKENS,
         )
+        token_ids = token_ids[-REASONING_GATE_MAX_SENTENCE_TOKENS:]
         return self._tokenizer.decode(token_ids, skip_special_tokens=True)
 
     def _build_prompt(
